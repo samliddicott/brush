@@ -1443,8 +1443,8 @@ async fn apply_assignment(
 
     // See if we need to eval an array index.
     if let Some(idx) = &array_index {
-        let will_be_indexed_array = if let Some((_, existing_value)) =
-            shell.env().get(variable_name)
+        let will_be_indexed_array = if let Some(existing_value) =
+            shell.env_var_cloned(variable_name)?
         {
             matches!(
                 existing_value.value(),
@@ -1495,7 +1495,8 @@ async fn apply_assignment(
                 existing_value.export();
             }
 
-            // That's it!
+            // Push shared-backed scalar updates into the shared region.
+            shell.shared_sync_from_env(variable_name.as_str())?;
             return Ok(());
         }
     }
@@ -1526,7 +1527,11 @@ async fn apply_assignment(
         new_var.export();
     }
 
-    shell.env_mut().add(variable_name, new_var, creation_scope)
+    shell
+        .env_mut()
+        .add(variable_name.as_str(), new_var, creation_scope)?;
+    shell.shared_sync_from_env(variable_name.as_str())?;
+    Ok(())
 }
 
 #[expect(clippy::too_many_lines)]

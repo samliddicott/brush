@@ -29,8 +29,8 @@ pub mod pathcache;
 pub mod pathsearch;
 pub mod patterns;
 pub mod processes;
-pub mod python;
 mod prompt;
+pub mod python;
 mod regex;
 pub mod results;
 pub mod shared_memory;
@@ -53,13 +53,13 @@ pub mod parser {
     };
 }
 
-pub use commands::{CommandArg, ExecutionContext};
 pub use cancel::CancellationToken;
+pub use commands::{CommandArg, ExecutionContext};
 pub use error::{BuiltinError, Error, ErrorKind};
 pub use extensions::ShellExtensions;
 pub use interp::{ExecutionParameters, ProcessGroupPolicy};
-pub use python::PythonContext;
 pub use parser::{SourcePosition, SourcePositionOffset, SourceSpan};
+pub use python::PythonContext;
 pub use results::{ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ExecutionSpawnResult};
 pub use shell::{
     ContextMode, CreateOptions, ProfileLoadBehavior, RcLoadBehavior, Shell, ShellBuilder,

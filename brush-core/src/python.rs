@@ -105,7 +105,9 @@ mod imp {
 
     impl<SE: extensions::ShellExtensions> LiveBridge for ShellLiveBridge<SE> {
         fn vars_get(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
-            if let Some(obj) = get_tied_var_as_py(py, self.shell(), name).map_err(to_py_runtime_error)? {
+            if let Some(obj) =
+                get_tied_var_as_py(py, self.shell(), name).map_err(to_py_runtime_error)?
+            {
                 return Ok(obj);
             }
             let Some(var) = self.shell().env_var(name) else {
@@ -116,8 +118,7 @@ mod imp {
 
         fn vars_set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
             if self.shell().python().tie(name).is_some() {
-                set_tied_var_from_py(self.shell_mut(), name, value)
-                    .map_err(to_py_runtime_error)?;
+                set_tied_var_from_py(self.shell_mut(), name, value).map_err(to_py_runtime_error)?;
                 return Ok(());
             }
 
@@ -385,7 +386,11 @@ mod imp {
             })
         }
 
-        fn run_capture_for_call(&mut self, req: &RunRequest, command: &str) -> PyResult<RunOutcome> {
+        fn run_capture_for_call(
+            &mut self,
+            req: &RunRequest,
+            command: &str,
+        ) -> PyResult<RunOutcome> {
             let params = self.shell().default_exec_params();
             let output = tokio::task::block_in_place(|| {
                 let rt = tokio::runtime::Handle::current();
@@ -552,8 +557,12 @@ mod imp {
 
             let value_obj = value.clone().unbind();
             let call = || -> Result<(), PyErr> {
-                let in_obj = coerce_tie_value(py, value_obj.bind(py).to_owned().into_any(), binding.tie_type)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let in_obj = coerce_tie_value(
+                    py,
+                    value_obj.bind(py).to_owned().into_any(),
+                    binding.tie_type,
+                )
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 setter.bind(py).call1((in_obj,))?;
                 Ok(())
             };
@@ -2230,7 +2239,6 @@ mod imp {
     ) -> Result<(), error::Error> {
         Ok(())
     }
-
 }
 
 pub use imp::*;

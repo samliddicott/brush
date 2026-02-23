@@ -84,6 +84,11 @@ mod imp {
         size: usize,
     }
 
+    // Safety: access to SharedRegion from multiple threads is synchronized by callers
+    // (Shell uses Arc<Mutex<SharedRegion>>). The mapping address is process-wide valid.
+    unsafe impl Send for SharedRegion {}
+    unsafe impl Sync for SharedRegion {}
+
     impl SharedRegion {
         /// Creates a new anonymous shared region with the given size.
         pub fn create(size: usize) -> Result<Self, error::Error> {
@@ -117,9 +122,8 @@ mod imp {
                 return Err(std::io::Error::last_os_error().into());
             }
 
-            let ptr = NonNull::new(mapped.cast::<u8>()).ok_or_else(|| {
-                error::ErrorKind::InternalError("mmap returned null".to_string())
-            })?;
+            let ptr = NonNull::new(mapped.cast::<u8>())
+                .ok_or_else(|| error::ErrorKind::InternalError("mmap returned null".to_string()))?;
 
             let mut region = Self { fd, ptr, size };
             region.initialize_header()?;
@@ -132,11 +136,13 @@ mod imp {
                 let entry = EntryHeader {
                     state: ENTRY_STATE_LIVE,
                     entry_type: EntryType::Scalar as u8,
-                    name_len: u16::try_from(name.len())
-                        .map_err(|_| error::ErrorKind::InternalError("name too long".to_string()))?,
+                    name_len: u16::try_from(name.len()).map_err(|_| {
+                        error::ErrorKind::InternalError("name too long".to_string())
+                    })?,
                     key_len: 0,
-                    val_len: u32::try_from(value.len())
-                        .map_err(|_| error::ErrorKind::InternalError("value too long".to_string()))?,
+                    val_len: u32::try_from(value.len()).map_err(|_| {
+                        error::ErrorKind::InternalError("value too long".to_string())
+                    })?,
                 };
                 region.append_entry(&entry, name.as_bytes(), &[], value.as_bytes())?;
                 Ok(())
@@ -170,8 +176,9 @@ mod imp {
                 let entry = EntryHeader {
                     state: ENTRY_STATE_TOMBSTONE,
                     entry_type: EntryType::Meta as u8,
-                    name_len: u16::try_from(name.len())
-                        .map_err(|_| error::ErrorKind::InternalError("name too long".to_string()))?,
+                    name_len: u16::try_from(name.len()).map_err(|_| {
+                        error::ErrorKind::InternalError("name too long".to_string())
+                    })?,
                     key_len: 0,
                     val_len: 0,
                 };
@@ -288,10 +295,10 @@ mod imp {
                 while used + total_len > new_size {
                     new_size = new_size.saturating_mul(2);
                     if new_size < self.size {
-                        return Err(
-                            error::ErrorKind::InternalError("shared region size overflow".to_string())
-                                .into(),
-                        );
+                        return Err(error::ErrorKind::InternalError(
+                            "shared region size overflow".to_string(),
+                        )
+                        .into());
                     }
                 }
 
@@ -314,7 +321,11 @@ mod imp {
             }
             off += size_of::<EntryHeader>();
             unsafe {
-                std::ptr::copy_nonoverlapping(name.as_ptr(), self.ptr.as_ptr().add(off), name.len());
+                std::ptr::copy_nonoverlapping(
+                    name.as_ptr(),
+                    self.ptr.as_ptr().add(off),
+                    name.len(),
+                );
             }
             off += name.len();
             unsafe {
@@ -379,7 +390,9 @@ mod imp {
             let used = usize::try_from(header.used_bytes)
                 .map_err(|_| error::ErrorKind::InternalError("used overflow".to_string()))?;
             if used > self.size || used < size_of::<RegionHeader>() {
-                return Err(error::ErrorKind::InternalError("corrupt shared header".to_string()).into());
+                return Err(
+                    error::ErrorKind::InternalError("corrupt shared header".to_string()).into(),
+                );
             }
 
             let mut entries = Vec::new();
@@ -395,7 +408,10 @@ mod imp {
                 let vlen = usize::try_from(e.val_len)
                     .map_err(|_| error::ErrorKind::InternalError("entry overflow".to_string()))?;
                 if off + nlen + klen + vlen > used {
-                    return Err(error::ErrorKind::InternalError("corrupt shared entry".to_string()).into());
+                    return Err(error::ErrorKind::InternalError(
+                        "corrupt shared entry".to_string(),
+                    )
+                    .into());
                 }
 
                 let name = unsafe {
@@ -415,10 +431,10 @@ mod imp {
                 off += vlen;
 
                 let Some(entry_type) = EntryType::from_byte(e.entry_type) else {
-                    return Err(
-                        error::ErrorKind::InternalError("unknown shared entry type".to_string())
-                            .into(),
-                    );
+                    return Err(error::ErrorKind::InternalError(
+                        "unknown shared entry type".to_string(),
+                    )
+                    .into());
                 };
 
                 entries.push(DecodedEntry {

@@ -1,6 +1,6 @@
-//! Phase 3 integration tests for Python->bash callback APIs.
+//! Phase 7 integration tests for shared-memory-backed shell variables.
 
-#![cfg(all(unix, feature = "python-pyo3"))]
+#![cfg(all(target_os = "linux", feature = "python-pyo3"))]
 #![cfg(test)]
 #![allow(clippy::panic_in_result_fn)]
 
@@ -58,50 +58,25 @@ fn run_script(script: &str) -> anyhow::Result<std::process::Output> {
 }
 
 #[test]
-fn bash_callable_returns_stdout_string() -> anyhow::Result<()> {
-    let output = run_script("py \"print(bash('echo', 'hello'))\"")?;
+fn shared_scalar_mutation_in_subshell_is_visible_in_parent() -> anyhow::Result<()> {
+    let output = run_script("shared x=0; (x=42); echo \"$x\"")?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "hello\n");
+    assert_eq!(String::from_utf8(output.stdout)?, "42\n");
     Ok(())
 }
 
 #[test]
-fn bash_run_returns_completed_shape_without_pipes() -> anyhow::Result<()> {
-    let output = run_script(
-        "py \"r = bash.run('true'); print(r.returncode); print(len(r.stdout)); print(len(r.stderr))\"",
-    )?;
+fn shared_bind_existing_name_uses_current_scalar_value() -> anyhow::Result<()> {
+    let output = run_script("y=abc; shared y; (y=def); echo \"$y\"")?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "0\n0\n0\n");
+    assert_eq!(String::from_utf8(output.stdout)?, "def\n");
     Ok(())
 }
 
 #[test]
-fn bash_run_check_raises_on_nonzero() -> anyhow::Result<()> {
-    let output = run_script(
-        "py -x \"bash.run('false', check=True)\"; printf '%s|%s' \"$MCBASH_EXCEPTION\" \"$MCBASH_EXCEPTION_LANG\"",
-    )?;
+fn shared_delete_unbinds_and_unsets_name() -> anyhow::Result<()> {
+    let output = run_script("shared z=1; shared -d z; test -z \"${z+x}\" && echo gone")?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "RuntimeError|python");
-    Ok(())
-}
-
-#[test]
-fn bash_run_shell_true_uses_command_string() -> anyhow::Result<()> {
-    let output = run_script("x=1; py \"bash.run('x=2', shell=True)\"; echo \"$x\"")?;
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "1\n");
-    Ok(())
-}
-
-#[test]
-fn bash_run_capture_output_is_deferred_to_phase6() -> anyhow::Result<()> {
-    let output = run_script(
-        "py -x \"bash.run('echo', 'phase3', capture_output=True)\"; echo \"$MCBASH_EXCEPTION_MSG\"",
-    )?;
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8(output.stdout)?,
-        "bash.run pipe/input/timeout features are deferred to phase 6 (bash.popen)\n"
-    );
+    assert_eq!(String::from_utf8(output.stdout)?, "gone\n");
     Ok(())
 }

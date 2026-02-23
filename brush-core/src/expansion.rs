@@ -1181,7 +1181,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 let allow_unset = match &parameter {
                     brush_parser::word::Parameter::NamedWithIndex { name, .. }
                     | brush_parser::word::Parameter::NamedWithAllIndices { name, .. } => {
-                        self.shell.env().get(name).is_some()
+                        self.shell.env_var_cloned(name)?.is_some()
                     }
                     _ => false,
                 };
@@ -1515,7 +1515,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 variable_name,
                 concatenate,
             } => {
-                let keys = if let Some((_, var)) = self.shell.env().get(variable_name) {
+                let keys = if let Some(var) = self.shell.env_var_cloned(&variable_name)? {
                     var.value().element_keys(self.shell)
                 } else {
                     vec![]
@@ -1542,7 +1542,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         let (variable_name, index) = match parameter {
             brush_parser::word::Parameter::Named(name) => (name, None),
             brush_parser::word::Parameter::NamedWithIndex { name, index } => {
-                let is_set_assoc_array = if let Some((_, var)) = self.shell.env().get(name) {
+                let is_set_assoc_array = if let Some(var) = self.shell.env_var_cloned(name)? {
                     matches!(
                         var.value(),
                         ShellValue::AssociativeArray(_)
@@ -1575,7 +1575,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 |_| Ok(()),
                 env::EnvironmentLookup::Anywhere,
                 env::EnvironmentScope::Global,
-            )
+            )?;
+            self.shell.shared_sync_from_env(variable_name)
         } else {
             self.shell.env_mut().update_or_add(
                 variable_name,
@@ -1583,7 +1584,8 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 |_| Ok(()),
                 env::EnvironmentLookup::Anywhere,
                 env::EnvironmentScope::Global,
-            )
+            )?;
+            self.shell.shared_sync_from_env(variable_name)
         }
     }
 
@@ -1620,9 +1622,11 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             } => (Some(name.to_owned()), None),
         };
 
-        let var = name
-            .as_ref()
-            .and_then(|name| self.shell.env().get(name).map(|(_, var)| var.clone()));
+        let var = if let Some(name) = &name {
+            self.shell.env_var_cloned(name).ok().flatten()
+        } else {
+            None
+        };
 
         (name, index, var)
     }
@@ -1702,7 +1706,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             brush_parser::word::Parameter::Named(n) => {
                 if !env::valid_variable_name(n.as_str()) {
                     Err(error::ErrorKind::BadSubstitution(n.clone()).into())
-                } else if let Some((_, var)) = self.shell.env().get(n) {
+                } else if let Some(var) = self.shell.env_var_cloned(n)? {
                     if matches!(var.value(), ShellValue::Unset(_)) {
                         self.undefined_expansion(parameter, allow_unset_vars)
                     } else {
@@ -1719,7 +1723,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             }
             brush_parser::word::Parameter::NamedWithIndex { name, index } => {
                 // First check to see if it's an associative array.
-                let is_set_assoc_array = if let Some((_, var)) = self.shell.env().get(name) {
+                let is_set_assoc_array = if let Some(var) = self.shell.env_var_cloned(name)? {
                     matches!(
                         var.value(),
                         ShellValue::AssociativeArray(_)
@@ -1735,7 +1739,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                     .await?;
 
                 // Index into the array.
-                if let Some((_, var)) = self.shell.env().get(name)
+                if let Some(var) = self.shell.env_var_cloned(name)?
                     && let Ok(Some(value)) = var.value().get_at(index_to_use.as_str(), self.shell)
                 {
                     Ok(Expansion::from(value.to_string()))
@@ -1744,7 +1748,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 }
             }
             brush_parser::word::Parameter::NamedWithAllIndices { name, concatenate } => {
-                if let Some((_, var)) = self.shell.env().get(name) {
+                if let Some(var) = self.shell.env_var_cloned(name)? {
                     let values = var.value().element_values(self.shell);
 
                     Ok(Expansion {

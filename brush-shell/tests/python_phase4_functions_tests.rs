@@ -59,7 +59,9 @@ fn run_script(script: &str) -> anyhow::Result<std::process::Output> {
 
 #[test]
 fn bash_fn_contains_and_iterates() -> anyhow::Result<()> {
-    let output = run_script("demo_fn() { :; }; py \"print('demo_fn' in bash.fn); print('demo_fn' in list(bash.fn))\"")?;
+    let output = run_script(
+        "demo_fn() { :; }; py \"print('demo_fn' in bash.fn); print('demo_fn' in list(bash.fn))\"",
+    )?;
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(String::from_utf8(output.stdout)?, "True\nTrue\n");
     Ok(())
@@ -67,7 +69,8 @@ fn bash_fn_contains_and_iterates() -> anyhow::Result<()> {
 
 #[test]
 fn bash_fn_getitem_returns_function_body() -> anyhow::Result<()> {
-    let output = run_script("demo_body() { echo hi; }; py \"print('echo hi' in bash.fn['demo_body'])\"")?;
+    let output =
+        run_script("demo_body() { echo hi; }; py \"print('echo hi' in bash.fn['demo_body'])\"")?;
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(String::from_utf8(output.stdout)?, "True\n");
     Ok(())
@@ -75,7 +78,8 @@ fn bash_fn_getitem_returns_function_body() -> anyhow::Result<()> {
 
 #[test]
 fn bash_fn_attribute_call_invokes_shell_function() -> anyhow::Result<()> {
-    let output = run_script("greet_fn() { echo hello:$1; }; py \"print(bash.fn.greet_fn('sam'))\"")?;
+    let output =
+        run_script("greet_fn() { echo hello:$1; }; py \"print(bash.fn.greet_fn('sam'))\"")?;
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(String::from_utf8(output.stdout)?, "hello:sam\n");
     Ok(())
@@ -83,7 +87,9 @@ fn bash_fn_attribute_call_invokes_shell_function() -> anyhow::Result<()> {
 
 #[test]
 fn bash_fn_missing_attribute_raises_attribute_error() -> anyhow::Result<()> {
-    let output = run_script("py \"\ntry:\n    bash.fn.no_such_fn()\nexcept Exception as e:\n    print(type(e).__name__)\n\"")?;
+    let output = run_script(
+        "py \"\ntry:\n    bash.fn.no_such_fn()\nexcept Exception as e:\n    print(type(e).__name__)\n\"",
+    )?;
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(String::from_utf8(output.stdout)?, "AttributeError\n");
     Ok(())
@@ -99,7 +105,8 @@ fn bash_fn_setitem_string_defines_shell_function() -> anyhow::Result<()> {
 
 #[test]
 fn bash_fn_setitem_callable_defines_shell_wrapper() -> anyhow::Result<()> {
-    let output = run_script("py \"bash.fn['py_add'] = lambda a, b: int(a) + int(b)\"; py_add 20 22")?;
+    let output =
+        run_script("py \"bash.fn['py_add'] = lambda a, b: int(a) + int(b)\"; py_add 20 22")?;
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(String::from_utf8(output.stdout)?, "42\n");
     Ok(())

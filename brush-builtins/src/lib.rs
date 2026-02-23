@@ -82,6 +82,8 @@ mod read;
 mod return_;
 #[cfg(feature = "builtin.set")]
 mod set;
+#[cfg(feature = "builtin.shared")]
+mod shared;
 #[cfg(feature = "builtin.shift")]
 mod shift;
 #[cfg(feature = "builtin.shopt")]

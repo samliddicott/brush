@@ -41,6 +41,7 @@ mod job_control;
 mod parsing;
 mod prompts;
 mod readline;
+mod shared;
 mod state;
 mod traps;
 
@@ -94,6 +95,10 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// Embedded Python runtime context.
     #[cfg_attr(feature = "serde", serde(skip, default))]
     python: PythonContext,
+
+    /// Shared-memory variable bridge state.
+    #[cfg_attr(feature = "serde", serde(skip, default))]
+    shared: shared::SharedContext,
 
     /// Cooperative cancellation token for this shell context.
     #[cfg_attr(feature = "serde", serde(skip, default))]
@@ -179,6 +184,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             funcs: self.funcs.clone(),
             options: self.options.clone(),
             python: self.python.clone(),
+            shared: self.shared.clone(),
             cancel: CancellationToken::new(),
             context_mode: ContextMode::Isolated,
             jobs: jobs::JobManager::new(),
