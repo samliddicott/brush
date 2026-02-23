@@ -136,6 +136,10 @@ pub enum TokenizerError {
     #[error("unterminated here document sequence; tag(s) [{0}] found at: [{1}]")]
     UnterminatedHereDocuments(String, String),
 
+    /// An unterminated `PYTHON ... END_PYTHON` block was encountered.
+    #[error("unterminated PYTHON block; missing END_PYTHON (started at {0})")]
+    UnterminatedPythonBlock(SourcePosition),
+
     /// An I/O error occurred while reading from the input stream.
     #[error("failed to read input")]
     ReadError(#[from] std::io::Error),

@@ -29,6 +29,30 @@ impl builtins::Command for PyCommand {
             }
         };
         let remaining = options.remaining;
+        let invoked_as_python_block = context.command_name == "PYTHON";
+
+        if invoked_as_python_block
+            && context
+                .try_fd(brush_core::openfiles::OpenFiles::STDIN_FD)
+                .is_some_and(|f| !f.is_terminal())
+        {
+            let mut script = String::new();
+            context.stdin().read_to_string(&mut script)?;
+            if !script.is_empty() {
+                let code = if options.no_dedent {
+                    script
+                } else {
+                    dedent_text(&script)
+                };
+                let py_options = brush_core::python::PyExecOptions {
+                    expression_mode: options.expression_mode,
+                    structured_exceptions: options.structured_exceptions,
+                };
+                let outcome =
+                    brush_core::python::exec_code_with_options(context.shell, &code, py_options)?;
+                return finalize_outcome(&mut context, outcome, &options);
+            }
+        }
 
         if let Some(name) = &options.tie_var {
             if !remaining.is_empty() {
@@ -89,13 +113,17 @@ impl builtins::Command for PyCommand {
                 context.params.remove_fd(fd);
             }
 
-            let dedented = dedent_text(&script);
+            let code = if options.no_dedent {
+                script
+            } else {
+                dedent_text(&script)
+            };
             let py_options = brush_core::python::PyExecOptions {
                 expression_mode: options.expression_mode,
                 structured_exceptions: options.structured_exceptions,
             };
             let outcome =
-                brush_core::python::exec_code_with_options(context.shell, &dedented, py_options)?;
+                brush_core::python::exec_code_with_options(context.shell, &code, py_options)?;
             return finalize_outcome(&mut context, outcome, &options);
         }
 
@@ -116,6 +144,7 @@ impl builtins::Command for PyCommand {
 struct ParsedOptions<'a> {
     expression_mode: bool,
     structured_exceptions: bool,
+    no_dedent: bool,
     capture_stdout_var: Option<String>,
     capture_result_var: Option<String>,
     tie_var: Option<String>,
@@ -126,6 +155,7 @@ struct ParsedOptions<'a> {
 fn parse_options(args: &[String]) -> Result<ParsedOptions<'_>, ()> {
     let mut expression_mode = false;
     let mut structured_exceptions = false;
+    let mut no_dedent = false;
     let mut capture_stdout_var: Option<String> = None;
     let mut capture_result_var: Option<String> = None;
     let mut tie_var: Option<String> = None;
@@ -147,6 +177,10 @@ fn parse_options(args: &[String]) -> Result<ParsedOptions<'_>, ()> {
             }
             "-x" => {
                 structured_exceptions = true;
+                i += 1;
+            }
+            "--no-dedent" => {
+                no_dedent = true;
                 i += 1;
             }
             "-v" => {
@@ -189,6 +223,7 @@ fn parse_options(args: &[String]) -> Result<ParsedOptions<'_>, ()> {
     Ok(ParsedOptions {
         expression_mode,
         structured_exceptions,
+        no_dedent,
         capture_stdout_var,
         capture_result_var,
         tie_var,

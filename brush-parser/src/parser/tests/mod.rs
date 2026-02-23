@@ -11,6 +11,7 @@ mod extended_test;
 mod functions;
 mod here_docs;
 mod pipelines;
+mod python_blocks;
 mod redirections;
 mod simple_commands;
 

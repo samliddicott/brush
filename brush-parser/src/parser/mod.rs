@@ -149,28 +149,22 @@ impl<R: std::io::BufRead> Parser<R> {
         //   * https://aosabook.org/en/v1/bash.html
         //   * https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html
         //
+        let input = self.read_and_preprocess_input()?;
+
         match self.options.parser_impl {
             ParserImpl::Peg => {
-                let tokens = self.tokenize()?;
+                let tokens = tokenize_preprocessed_input(&input, &self.options)?;
                 parse_tokens(&tokens, &self.options)
             }
             #[cfg(feature = "winnow-parser")]
             ParserImpl::Winnow => {
-                // Read entire input to string for winnow_str parser
-                let mut input_str = String::new();
-                std::io::Read::read_to_string(&mut self.reader, &mut input_str).map_err(|e| {
-                    crate::error::ParseError::Tokenizing {
-                        inner: crate::tokenizer::TokenizerError::from(e),
-                        position: None,
-                    }
-                })?;
-
-                winnow_str::parse_program(&input_str, &self.options, &SourceInfo::default())
-                    .map_err(|_e| {
+                winnow_str::parse_program(&input, &self.options, &SourceInfo::default()).map_err(
+                    |_e| {
                         // Convert winnow error to ParseError
                         // TODO: Extract position information from winnow error
                         crate::error::ParseError::ParsingAtEndOfInput
-                    })
+                    },
+                )
             }
         }
     }
@@ -180,45 +174,214 @@ impl<R: std::io::BufRead> Parser<R> {
     pub fn parse_function_parens_and_body(
         &mut self,
     ) -> Result<ast::FunctionBody, crate::error::ParseError> {
-        let tokens = self.tokenize()?;
+        let input = self.read_and_preprocess_input()?;
+        let tokens = tokenize_preprocessed_input(&input, &self.options)?;
         let parse_result =
             peg::token_parser::function_parens_and_body(&Tokens { tokens: &tokens }, &self.options);
         parse_result_to_error(parse_result, &tokens)
     }
 
-    fn tokenize(&mut self) -> Result<Vec<Token>, crate::error::ParseError> {
-        // First we tokenize the input, according to the policy implied by provided options.
-        let mut tokenizer = Tokenizer::new(&mut self.reader, &self.options.tokenizer_options());
+    fn read_and_preprocess_input(&mut self) -> Result<String, crate::error::ParseError> {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut self.reader, &mut input).map_err(|e| {
+            crate::error::ParseError::Tokenizing {
+                inner: crate::tokenizer::TokenizerError::from(e),
+                position: None,
+            }
+        })?;
 
-        tracing::debug!(target: "tokenize", "Tokenizing...");
-
-        let mut tokens = vec![];
-        loop {
-            let result = match tokenizer.next_token() {
-                Ok(result) => result,
-                Err(e) => {
-                    return Err(crate::error::ParseError::Tokenizing {
-                        inner: e,
-                        position: tokenizer.current_location(),
-                    });
-                }
+        preprocess_python_blocks(&input).map_err(|inner| {
+            let position = match &inner {
+                crate::tokenizer::TokenizerError::UnterminatedPythonBlock(pos) => Some(pos.clone()),
+                _ => None,
             };
+            crate::error::ParseError::Tokenizing { inner, position }
+        })
+    }
+}
 
-            let reason = result.reason;
-            if let Some(token) = result.token {
-                tracing::debug!(target: "tokenize", "TOKEN {}: {:?} {reason:?}", tokens.len(), token);
-                tokens.push(token);
-            }
+fn tokenize_preprocessed_input(
+    input: &str,
+    options: &ParserOptions,
+) -> Result<Vec<Token>, crate::error::ParseError> {
+    // First we tokenize the input, according to the policy implied by provided options.
+    let mut reader = std::io::BufReader::new(input.as_bytes());
+    let mut tokenizer = Tokenizer::new(&mut reader, &options.tokenizer_options());
 
-            if matches!(reason, TokenEndReason::EndOfInput) {
-                break;
+    tracing::debug!(target: "tokenize", "Tokenizing...");
+
+    let mut tokens = vec![];
+    loop {
+        let result = match tokenizer.next_token() {
+            Ok(result) => result,
+            Err(e) => {
+                return Err(crate::error::ParseError::Tokenizing {
+                    inner: e,
+                    position: tokenizer.current_location(),
+                });
             }
+        };
+
+        let reason = result.reason;
+        if let Some(token) = result.token {
+            tracing::debug!(target: "tokenize", "TOKEN {}: {:?} {reason:?}", tokens.len(), token);
+            tokens.push(token);
         }
 
-        tracing::debug!(target: "tokenize", "  => {} token(s)", tokens.len());
-
-        Ok(tokens)
+        if matches!(reason, TokenEndReason::EndOfInput) {
+            break;
+        }
     }
+
+    tracing::debug!(target: "tokenize", "  => {} token(s)", tokens.len());
+
+    Ok(tokens)
+}
+
+fn preprocess_python_blocks(input: &str) -> Result<String, crate::tokenizer::TokenizerError> {
+    let mut output = String::with_capacity(input.len() + 64);
+    let lines = input.split_inclusive('\n').collect::<Vec<_>>();
+
+    let mut i = 0usize;
+    let mut line_no = 1usize;
+    while i < lines.len() {
+        let line = lines[i];
+
+        if let Some(insert_at) = find_python_block_insert(line) {
+            let start_line = line_no;
+            output.push_str(&line[..insert_at]);
+            output.push_str(" <<'END_PYTHON'");
+            output.push_str(&line[insert_at..]);
+
+            i += 1;
+            line_no += 1;
+
+            let mut found_end = false;
+            while i < lines.len() {
+                let body_line = lines[i];
+                output.push_str(body_line);
+                if body_line == "END_PYTHON\n" || body_line == "END_PYTHON" {
+                    found_end = true;
+                    i += 1;
+                    line_no += 1;
+                    break;
+                }
+                i += 1;
+                line_no += 1;
+            }
+
+            if !found_end {
+                return Err(crate::tokenizer::TokenizerError::UnterminatedPythonBlock(
+                    crate::SourcePosition {
+                        index: 0,
+                        line: start_line,
+                        column: 1,
+                    },
+                ));
+            }
+
+            continue;
+        }
+
+        output.push_str(line);
+        i += 1;
+        line_no += 1;
+    }
+
+    Ok(output)
+}
+
+fn find_python_block_insert(line: &str) -> Option<usize> {
+    let mut line_end = line.len();
+    if line.ends_with('\n') {
+        line_end -= 1;
+    }
+    let line_no_nl = &line[..line_end];
+    if line_no_nl.trim().is_empty() {
+        return None;
+    }
+
+    let pipes = unquoted_pipe_positions(line_no_nl);
+    let mut segment_starts = Vec::with_capacity(pipes.len() + 1);
+    let mut segment_ends = Vec::with_capacity(pipes.len() + 1);
+    let mut start = 0usize;
+    for p in &pipes {
+        segment_starts.push(start);
+        segment_ends.push(*p);
+        start = p + 1;
+    }
+    segment_starts.push(start);
+    segment_ends.push(line_no_nl.len());
+
+    let mut insert_at: Option<usize> = None;
+    for (seg_start, seg_end) in segment_starts.into_iter().zip(segment_ends) {
+        let segment = &line_no_nl[seg_start..seg_end];
+        if segment_is_python_command(segment) {
+            if insert_at.is_some() {
+                // Multiple PYTHON segments on one line are ambiguous for block collection.
+                return None;
+            }
+            insert_at = Some(seg_end);
+        }
+    }
+
+    insert_at.map(|idx| {
+        if idx == line_no_nl.len() {
+            line_end
+        } else {
+            idx
+        }
+    })
+}
+
+fn segment_is_python_command(segment: &str) -> bool {
+    let s = segment.trim_start();
+    if s.starts_with('#') || !s.starts_with("PYTHON") {
+        return false;
+    }
+    let rest = &s["PYTHON".len()..];
+    rest.chars()
+        .next()
+        .is_none_or(|c| c.is_whitespace() || matches!(c, '<' | '>'))
+}
+
+fn unquoted_pipe_positions(s: &str) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut chars = s.char_indices().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+
+        if !in_single && !in_double && ch == '|' {
+            // Ignore |&; this transform only targets pipeline separators.
+            if chars.peek().is_some_and(|(_, next)| *next == '&') {
+                continue;
+            }
+            positions.push(idx);
+        }
+    }
+
+    positions
 }
 
 /// Parses a sequence of tokens into the abstract syntax tree (AST) of a shell program.

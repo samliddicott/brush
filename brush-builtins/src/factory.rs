@@ -127,6 +127,8 @@ pub fn default_builtins<SE: brush_core::ShellExtensions>(
     m.insert("pwd".into(), builtin::<pwd::PwdCommand, SE>());
     #[cfg(feature = "builtin.py")]
     m.insert("py".into(), builtin::<py::PyCommand, SE>());
+    #[cfg(feature = "builtin.py")]
+    m.insert("PYTHON".into(), builtin::<py::PyCommand, SE>());
     #[cfg(feature = "builtin.read")]
     m.insert("read".into(), builtin::<read::ReadCommand, SE>());
     #[cfg(feature = "builtin.shared")]
