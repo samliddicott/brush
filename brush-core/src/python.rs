@@ -29,7 +29,7 @@ mod imp {
         fn vars_attrs(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject>;
         fn vars_set_attrs(
             &mut self,
-            py: Python<'_>,
+            _py: Python<'_>,
             name: &str,
             attrs: Option<&Bound<'_, PyDict>>,
         ) -> PyResult<PyObject>;
@@ -50,6 +50,15 @@ mod imp {
         fn funcs_keys(&mut self) -> PyResult<Vec<String>>;
         fn funcs_set_body(&mut self, name: &str, body: &str) -> PyResult<()>;
         fn funcs_del(&mut self, name: &str) -> PyResult<()>;
+        fn tie_set(
+            &mut self,
+            py: Python<'_>,
+            name: &str,
+            getter: &Bound<'_, PyAny>,
+            setter: Option<&Bound<'_, PyAny>>,
+            tie_type: Option<&str>,
+        ) -> PyResult<()>;
+        fn tie_unset(&mut self, name: &str) -> PyResult<()>;
         fn run_command(&mut self, py: Python<'_>, req: &RunRequest) -> PyResult<RunOutcome>;
     }
 
@@ -96,6 +105,7 @@ mod imp {
 
     impl<SE: extensions::ShellExtensions> LiveBridge for ShellLiveBridge<SE> {
         fn vars_get(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+            let _ = sync_tied_var_from_python(self.shell_mut(), name).map_err(to_py_runtime_error)?;
             let Some(var) = self.shell().env_var(name) else {
                 return Err(PyKeyError::new_err(name.to_string()));
             };
@@ -103,6 +113,12 @@ mod imp {
         }
 
         fn vars_set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+            if self.shell().python().tie(name).is_some() {
+                set_tied_var_from_py(self.shell_mut(), name, value)
+                    .map_err(to_py_runtime_error)?;
+                return Ok(());
+            }
+
             let mut var =
                 ShellVariable::new(py_any_to_shell_value(value).map_err(to_py_runtime_error)?);
 
@@ -126,16 +142,26 @@ mod imp {
         }
 
         fn vars_contains(&mut self, name: &str) -> PyResult<bool> {
+            if self.shell().python().tie(name).is_some() {
+                return Ok(true);
+            }
             Ok(self.shell().env().is_set(name))
         }
 
         fn vars_keys(&mut self) -> PyResult<Vec<String>> {
-            Ok(self
+            let mut keys = self
                 .shell()
                 .env()
                 .iter()
                 .map(|(name, _)| name.clone())
-                .collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+
+            for tied in self.shell().python().tie_names() {
+                if !keys.iter().any(|k| k == tied) {
+                    keys.push(tied.clone());
+                }
+            }
+            Ok(keys)
         }
 
         fn vars_attrs(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
@@ -268,6 +294,38 @@ mod imp {
 
         fn funcs_del(&mut self, name: &str) -> PyResult<()> {
             let _ = self.shell_mut().undefine_func(name);
+            Ok(())
+        }
+
+        fn tie_set(
+            &mut self,
+            _py: Python<'_>,
+            name: &str,
+            getter: &Bound<'_, PyAny>,
+            setter: Option<&Bound<'_, PyAny>>,
+            tie_type: Option<&str>,
+        ) -> PyResult<()> {
+            if !getter.is_callable() {
+                return Err(PyRuntimeError::new_err("getter must be callable"));
+            }
+            if let Some(s) = setter
+                && !s.is_callable()
+            {
+                return Err(PyRuntimeError::new_err("setter must be callable"));
+            }
+
+            let tie_type = parse_tie_type(tie_type).map_err(to_py_runtime_error)?;
+            self.shell_mut().python_mut().set_tie(
+                name.to_string(),
+                getter.clone().unbind(),
+                setter.map(|s| s.clone().unbind()),
+                tie_type,
+            );
+            Ok(())
+        }
+
+        fn tie_unset(&mut self, name: &str) -> PyResult<()> {
+            self.shell_mut().python_mut().unset_tie(name);
             Ok(())
         }
 
@@ -404,6 +462,185 @@ mod imp {
         PyRuntimeError::new_err(err.to_string())
     }
 
+    fn parse_tie_type(tie_type: Option<&str>) -> Result<Option<TieType>, error::Error> {
+        match tie_type {
+            None => Ok(None),
+            Some("scalar") => Ok(Some(TieType::Scalar)),
+            Some("integer") => Ok(Some(TieType::Integer)),
+            Some("array") => Ok(Some(TieType::Array)),
+            Some("assoc") => Ok(Some(TieType::Assoc)),
+            Some(other) => Err(error::ErrorKind::InternalError(format!(
+                "unsupported tie type: {other}"
+            ))
+            .into()),
+        }
+    }
+
+    fn cloned_tie_binding<SE: extensions::ShellExtensions>(
+        shell: &crate::Shell<SE>,
+        name: &str,
+    ) -> Option<TieBinding> {
+        Python::with_gil(|py| {
+            shell.python().tie(name).map(|tie| TieBinding {
+                getter: tie.getter.clone_ref(py),
+                setter: tie.setter.as_ref().map(|s| s.clone_ref(py)),
+                tie_type: tie.tie_type,
+            })
+        })
+    }
+
+    fn coerce_tie_value<'py>(
+        py: Python<'py>,
+        value: Bound<'py, PyAny>,
+        tie_type: Option<TieType>,
+    ) -> Result<Bound<'py, PyAny>, error::Error> {
+        let coerced = match tie_type {
+            None => value,
+            Some(TieType::Scalar) => value
+                .str()
+                .map(|s| s.into_any())
+                .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            Some(TieType::Integer) => {
+                let builtins = PyModule::import(py, "builtins")
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+                builtins
+                    .getattr("int")
+                    .and_then(|f| f.call1((value,)))
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
+            }
+            Some(TieType::Array) => {
+                let builtins = PyModule::import(py, "builtins")
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+                builtins
+                    .getattr("list")
+                    .and_then(|f| f.call1((value,)))
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
+            }
+            Some(TieType::Assoc) => {
+                let builtins = PyModule::import(py, "builtins")
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+                builtins
+                    .getattr("dict")
+                    .and_then(|f| f.call1((value,)))
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
+            }
+        };
+        Ok(coerced)
+    }
+
+    /// Returns whether the given shell variable name currently has an active Python tie.
+    pub fn is_tied_var<SE: extensions::ShellExtensions>(
+        shell: &crate::Shell<SE>,
+        name: &str,
+    ) -> bool {
+        shell.python().tie(name).is_some()
+    }
+
+    /// Refreshes a tied shell variable by invoking its Python getter and syncing the value into
+    /// the shell environment. Returns `true` when a tie exists for the name.
+    pub fn sync_tied_var_from_python<SE: extensions::ShellExtensions>(
+        shell: &mut crate::Shell<SE>,
+        name: &str,
+    ) -> Result<bool, error::Error> {
+        let Some(binding) = cloned_tie_binding(shell, name) else {
+            return Ok(false);
+        };
+
+        Python::with_gil(|py| -> Result<(), error::Error> {
+            let globals = shell.python_mut().ensure_globals(py);
+            let globals = globals.bind(py);
+            install_bash_bridge(py, globals)?;
+
+            let call = || -> Result<Bound<'_, PyAny>, PyErr> {
+                let out = binding.getter.bind(py).call0()?;
+                coerce_tie_value(py, out, binding.tie_type)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            };
+
+            let py_obj = call().map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+
+            let mut var = ShellVariable::new(py_any_to_shell_value(&py_obj)?);
+            if let Some(existing) = shell.env_var(name) {
+                preserve_attrs_from_existing(existing, &mut var)?;
+            }
+            shell.env_mut().set_global(name, var)?;
+            Ok(())
+        })?;
+
+        Ok(true)
+    }
+
+    fn set_tied_var_from_py<SE: extensions::ShellExtensions>(
+        shell: &mut crate::Shell<SE>,
+        name: &str,
+        value: &Bound<'_, PyAny>,
+    ) -> Result<(), error::Error> {
+        let Some(binding) = cloned_tie_binding(shell, name) else {
+            return Ok(());
+        };
+        let Some(setter) = binding.setter else {
+            return Err(error::ErrorKind::InternalError(format!(
+                "tied variable '{name}' is read-only"
+            ))
+            .into());
+        };
+
+        Python::with_gil(|py| -> Result<(), error::Error> {
+            let globals = shell.python_mut().ensure_globals(py);
+            let globals = globals.bind(py);
+            install_bash_bridge(py, globals)?;
+
+            let value_obj = value.clone().unbind();
+            let call = || -> Result<(), PyErr> {
+                let in_obj = coerce_tie_value(py, value_obj.bind(py).to_owned().into_any(), binding.tie_type)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                setter.bind(py).call1((in_obj,))?;
+                Ok(())
+            };
+            call().map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+            Ok(())
+        })?;
+
+        let _ = sync_tied_var_from_python(shell, name)?;
+        Ok(())
+    }
+
+    /// Pushes the current shell variable value into a tied Python setter (if one exists), then
+    /// re-syncs from the Python getter. Returns `true` when a tie exists for the name.
+    pub fn push_tied_var_to_python<SE: extensions::ShellExtensions>(
+        shell: &mut crate::Shell<SE>,
+        name: &str,
+    ) -> Result<bool, error::Error> {
+        let Some(binding) = cloned_tie_binding(shell, name) else {
+            return Ok(false);
+        };
+        let Some(setter) = binding.setter else {
+            return Ok(true);
+        };
+        let Some(var) = shell.env_var(name).cloned() else {
+            return Ok(true);
+        };
+
+        Python::with_gil(|py| -> Result<(), error::Error> {
+            let globals = shell.python_mut().ensure_globals(py);
+            let globals = globals.bind(py);
+            install_bash_bridge(py, globals)?;
+            let py_value = shell_var_to_py(py, shell, &var)?;
+
+            let call = || -> Result<(), PyErr> {
+                let in_obj = coerce_tie_value(py, py_value.bind(py).to_owned().into_any(), binding.tie_type)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                setter.bind(py).call1((in_obj,))?;
+                Ok(())
+            };
+            call().map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+            Ok(())
+        })?;
+
+        let _ = sync_tied_var_from_python(shell, name)?;
+        Ok(true)
+    }
+
     fn with_live_bridge<R>(f: impl FnOnce(&mut dyn LiveBridge) -> PyResult<R>) -> PyResult<R> {
         ACTIVE_BRIDGE.with(|slot| {
             let slot = slot.borrow_mut();
@@ -430,8 +667,24 @@ mod imp {
     }
 
     /// Python configuration and namespace state attached to a shell context.
+    struct TieBinding {
+        getter: Py<PyAny>,
+        setter: Option<Py<PyAny>>,
+        tie_type: Option<TieType>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TieType {
+        Scalar,
+        Integer,
+        Array,
+        Assoc,
+    }
+
+    /// Python configuration and namespace state attached to a shell context.
     pub struct PythonContext {
         globals: Option<Py<PyDict>>,
+        ties: BTreeMap<String, TieBinding>,
         /// Enables command-not-found fallback for dotted names.
         pub implicit_dotted_dispatch: bool,
         /// Enables shell-argument auto-conversion for callable dispatch.
@@ -480,6 +733,7 @@ mod imp {
         fn default() -> Self {
             Self {
                 globals: None,
+                ties: BTreeMap::new(),
                 implicit_dotted_dispatch: false,
                 auto_convert_args: true,
             }
@@ -491,6 +745,7 @@ mod imp {
         pub fn defaults_for_interactive(interactive: bool) -> Self {
             Self {
                 globals: None,
+                ties: BTreeMap::new(),
                 implicit_dotted_dispatch: interactive,
                 auto_convert_args: true,
             }
@@ -508,6 +763,20 @@ mod imp {
 
                 Self {
                     globals,
+                    ties: self
+                        .ties
+                        .iter()
+                        .map(|(name, tie)| {
+                            (
+                                name.clone(),
+                                TieBinding {
+                                    getter: tie.getter.clone_ref(py),
+                                    setter: tie.setter.as_ref().map(|s| s.clone_ref(py)),
+                                    tie_type: tie.tie_type,
+                                },
+                            )
+                        })
+                        .collect(),
                     implicit_dotted_dispatch: self.implicit_dotted_dispatch,
                     auto_convert_args: self.auto_convert_args,
                 }
@@ -522,6 +791,35 @@ mod imp {
                 self.globals = Some(d.clone_ref(py));
                 d
             }
+        }
+
+        fn set_tie(
+            &mut self,
+            name: String,
+            getter: Py<PyAny>,
+            setter: Option<Py<PyAny>>,
+            tie_type: Option<TieType>,
+        ) {
+            self.ties.insert(
+                name,
+                TieBinding {
+                    getter,
+                    setter,
+                    tie_type,
+                },
+            );
+        }
+
+        fn unset_tie(&mut self, name: &str) {
+            self.ties.remove(name);
+        }
+
+        fn tie(&self, name: &str) -> Option<&TieBinding> {
+            self.ties.get(name)
+        }
+
+        fn tie_names(&self) -> impl Iterator<Item = &String> {
+            self.ties.keys()
         }
     }
 
@@ -989,6 +1287,18 @@ mod imp {
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
             .add_function(
+                pyo3::wrap_pyfunction!(brush_tie, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_untie, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
                 pyo3::wrap_pyfunction!(brush_call, &bridge_module)
                     .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
             )
@@ -1418,6 +1728,31 @@ mod imp {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (name, getter, setter=None, tie_type=None))]
+    fn brush_tie(
+        py: Python<'_>,
+        name: String,
+        getter: Bound<'_, PyAny>,
+        setter: Option<Bound<'_, PyAny>>,
+        tie_type: Option<String>,
+    ) -> PyResult<()> {
+        with_live_bridge(|bridge| {
+            bridge.tie_set(
+                py,
+                name.as_str(),
+                &getter,
+                setter.as_ref(),
+                tie_type.as_deref(),
+            )
+        })
+    }
+
+    #[pyfunction]
+    fn brush_untie(name: String) -> PyResult<()> {
+        with_live_bridge(|bridge| bridge.tie_unset(name.as_str()))
+    }
+
+    #[pyfunction]
     fn brush_call(py: Python<'_>, args: Bound<'_, PyAny>) -> PyResult<PyObject> {
         let args = extract_args(&args)?;
         let req = RunRequest {
@@ -1503,85 +1838,24 @@ mod imp {
     }
 
     const BASH_BRIDGE_BOOTSTRAP: &str = r#"
-class _BrushTies:
-    def __init__(self):
-        self._items = {}
-
-    def tie(self, name, getter, setter=None, type=None):
-        if not callable(getter):
-            raise TypeError("getter must be callable")
-        if setter is not None and not callable(setter):
-            raise TypeError("setter must be callable")
-        self._items[name] = (getter, setter, type)
-
-    def untie(self, name):
-        self._items.pop(name, None)
-
-    def has(self, name):
-        return name in self._items
-
-    def get(self, name):
-        return self._items.get(name)
-
-    def names(self):
-        return list(self._items.keys())
-
-try:
-    _brush_ties
-except NameError:
-    _brush_ties = _BrushTies()
-
-def _brush_coerce_tie_value(name, value, tie_type):
-    if tie_type is None:
-        return value
-    if tie_type == "scalar":
-        return "" if value is None else str(value)
-    if tie_type == "integer":
-        return int(value)
-    if tie_type == "array":
-        return list(value)
-    if tie_type == "assoc":
-        return dict(value)
-    raise ValueError(f"unsupported tie type for {name}: {tie_type}")
-
-def _brush_sync_tied_value(name):
-    tie = _brush_ties.get(name)
-    if tie is None:
-        return None
-    getter, _setter, tie_type = tie
-    value = _brush_coerce_tie_value(name, getter(), tie_type)
-    _brush_bridge.brush_vars_set(name, value)
-    return value
-
 class _BrushVarsMap:
     def __getitem__(self, name):
-        if _brush_ties.has(name):
-            return _brush_sync_tied_value(name)
         return _brush_bridge.brush_vars_get(name)
 
     def __setitem__(self, name, value):
-        if _brush_ties.has(name):
-            getter, setter, tie_type = _brush_ties.get(name)
-            if setter is None:
-                raise RuntimeError(f"tied variable '{name}' is read-only")
-            setter(value)
-            _brush_bridge.brush_vars_set(name, _brush_coerce_tie_value(name, getter(), tie_type))
-            return
         _brush_bridge.brush_vars_set(name, value)
 
     def __delitem__(self, name):
-        if _brush_ties.has(name):
-            _brush_ties.untie(name)
         _brush_bridge.brush_vars_del(name)
 
     def __contains__(self, name):
-        return _brush_ties.has(name) or _brush_bridge.brush_vars_contains(name)
+        return _brush_bridge.brush_vars_contains(name)
 
     def __iter__(self):
-        return iter(set(_brush_bridge.brush_vars_keys()) | set(_brush_ties.names()))
+        return iter(_brush_bridge.brush_vars_keys())
 
     def __len__(self):
-        return len(set(_brush_bridge.brush_vars_keys()) | set(_brush_ties.names()))
+        return len(_brush_bridge.brush_vars_keys())
 
     def attrs(self, name):
         return set(_brush_bridge.brush_vars_attrs(name))
@@ -1719,11 +1993,10 @@ class _Brush:
         return completed
 
     def tie(self, name, getter, setter=None, type=None):
-        _brush_ties.tie(name, getter, setter, type)
-        _brush_sync_tied_value(name)
+        _brush_bridge.brush_tie(name, getter, setter, type)
 
     def untie(self, name):
-        _brush_ties.untie(name)
+        _brush_bridge.brush_untie(name)
 
 bash = _Brush()
 "#;
@@ -2016,6 +2289,27 @@ mod imp {
         _exception: &PyExceptionInfo,
     ) -> Result<(), error::Error> {
         Ok(())
+    }
+
+    pub fn is_tied_var<SE: extensions::ShellExtensions>(
+        _shell: &crate::Shell<SE>,
+        _name: &str,
+    ) -> bool {
+        false
+    }
+
+    pub fn sync_tied_var_from_python<SE: extensions::ShellExtensions>(
+        _shell: &mut crate::Shell<SE>,
+        _name: &str,
+    ) -> Result<bool, error::Error> {
+        Ok(false)
+    }
+
+    pub fn push_tied_var_to_python<SE: extensions::ShellExtensions>(
+        _shell: &mut crate::Shell<SE>,
+        _name: &str,
+    ) -> Result<bool, error::Error> {
+        Ok(false)
     }
 }
 

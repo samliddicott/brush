@@ -96,3 +96,23 @@ fn py_t_and_u_flags_register_and_remove_tie() -> anyhow::Result<()> {
     assert_eq!(String::from_utf8(output.stdout)?, "10\n31\n31\n");
     Ok(())
 }
+
+#[test]
+fn tied_var_expands_live_in_shell_parameter_expansion() -> anyhow::Result<()> {
+    let output = run_script(
+        "py \"x=5; bash.tie('x', lambda: x, lambda v: globals().__setitem__('x', int(v)))\"; echo \"$x\"; py \"x=8\"; echo \"$x\"",
+    )?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?, "5\n8\n");
+    Ok(())
+}
+
+#[test]
+fn shell_assignment_pushes_back_to_python_tie() -> anyhow::Result<()> {
+    let output = run_script(
+        "py \"x=1; bash.tie('x', lambda: x, lambda v: globals().__setitem__('x', int(v)))\"; x=44; py \"print(x)\"",
+    )?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?, "44\n");
+    Ok(())
+}
