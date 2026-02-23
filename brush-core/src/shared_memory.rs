@@ -74,6 +74,7 @@ mod imp {
         state: u8,
         entry_type: EntryType,
         name: String,
+        key: String,
         val: Vec<u8>,
     }
 
@@ -133,6 +134,8 @@ mod imp {
         /// Sets a scalar value in the shared store.
         pub fn set_scalar(&mut self, name: &str, value: &str) -> Result<(), error::Error> {
             self.with_write_lock(|region| {
+                region.append_tombstone(name)?;
+                region.append_meta(name, "type", "scalar")?;
                 let entry = EntryHeader {
                     state: ENTRY_STATE_LIVE,
                     entry_type: EntryType::Scalar as u8,
@@ -173,17 +176,123 @@ mod imp {
         /// Tombstones all values for `name`.
         pub fn unset_name(&mut self, name: &str) -> Result<(), error::Error> {
             self.with_write_lock(|region| {
-                let entry = EntryHeader {
-                    state: ENTRY_STATE_TOMBSTONE,
-                    entry_type: EntryType::Meta as u8,
-                    name_len: u16::try_from(name.len()).map_err(|_| {
-                        error::ErrorKind::InternalError("name too long".to_string())
-                    })?,
-                    key_len: 0,
-                    val_len: 0,
-                };
-                region.append_entry(&entry, name.as_bytes(), &[], &[])?;
+                region.append_tombstone(name)?;
                 Ok(())
+            })
+        }
+
+        /// Sets an indexed array value in the shared store.
+        pub fn set_indexed_array(
+            &mut self,
+            name: &str,
+            values: &std::collections::BTreeMap<u64, String>,
+        ) -> Result<(), error::Error> {
+            self.with_write_lock(|region| {
+                region.append_tombstone(name)?;
+                region.append_meta(name, "type", "array")?;
+                for (k, v) in values {
+                    region.append_kv_entry(
+                        EntryType::ArrayElement,
+                        name,
+                        k.to_string().as_str(),
+                        v.as_str(),
+                    )?;
+                }
+                Ok(())
+            })
+        }
+
+        /// Reads the effective indexed array value for `name`.
+        pub fn get_indexed_array(
+            &mut self,
+            name: &str,
+        ) -> Result<std::collections::BTreeMap<u64, String>, error::Error> {
+            self.with_read_lock(|region| {
+                let mut current = std::collections::BTreeMap::new();
+                for e in region.scan_entries()? {
+                    if e.name != name {
+                        continue;
+                    }
+                    if e.state == ENTRY_STATE_TOMBSTONE {
+                        current.clear();
+                        continue;
+                    }
+                    if e.entry_type == EntryType::ArrayElement
+                        && let Ok(idx) = e.key.parse::<u64>()
+                    {
+                        current.insert(idx, String::from_utf8_lossy(&e.val).to_string());
+                    }
+                }
+                Ok(current)
+            })
+        }
+
+        /// Sets an associative array value in the shared store.
+        pub fn set_assoc_array(
+            &mut self,
+            name: &str,
+            values: &std::collections::BTreeMap<String, String>,
+        ) -> Result<(), error::Error> {
+            self.with_write_lock(|region| {
+                region.append_tombstone(name)?;
+                region.append_meta(name, "type", "assoc")?;
+                for (k, v) in values {
+                    region.append_kv_entry(
+                        EntryType::AssocElement,
+                        name,
+                        k.as_str(),
+                        v.as_str(),
+                    )?;
+                }
+                Ok(())
+            })
+        }
+
+        /// Reads the effective associative array value for `name`.
+        pub fn get_assoc_array(
+            &mut self,
+            name: &str,
+        ) -> Result<std::collections::BTreeMap<String, String>, error::Error> {
+            self.with_read_lock(|region| {
+                let mut current = std::collections::BTreeMap::new();
+                for e in region.scan_entries()? {
+                    if e.name != name {
+                        continue;
+                    }
+                    if e.state == ENTRY_STATE_TOMBSTONE {
+                        current.clear();
+                        continue;
+                    }
+                    if e.entry_type == EntryType::AssocElement {
+                        current.insert(e.key.clone(), String::from_utf8_lossy(&e.val).to_string());
+                    }
+                }
+                Ok(current)
+            })
+        }
+
+        /// Sets a metadata key/value for `name`.
+        pub fn set_meta(&mut self, name: &str, key: &str, value: &str) -> Result<(), error::Error> {
+            self.with_write_lock(|region| region.append_meta(name, key, value))
+        }
+
+        /// Reads an effective metadata value for `name` and `key`.
+        pub fn get_meta(&mut self, name: &str, key: &str) -> Result<Option<String>, error::Error> {
+            self.with_read_lock(|region| {
+                let mut current: Option<String> = None;
+                for e in region.scan_entries()? {
+                    if e.name != name {
+                        continue;
+                    }
+                    if e.state == ENTRY_STATE_TOMBSTONE {
+                        current = None;
+                        continue;
+                    }
+                    if e.entry_type == EntryType::Meta && e.key == key {
+                        current = Some(String::from_utf8_lossy(&e.val).to_string());
+                    }
+                }
+                Ok(current)
             })
         }
 
@@ -346,6 +455,42 @@ mod imp {
             self.write_header(&header)
         }
 
+        fn append_tombstone(&mut self, name: &str) -> Result<(), error::Error> {
+            let entry = EntryHeader {
+                state: ENTRY_STATE_TOMBSTONE,
+                entry_type: EntryType::Meta as u8,
+                name_len: u16::try_from(name.len())
+                    .map_err(|_| error::ErrorKind::InternalError("name too long".to_string()))?,
+                key_len: 0,
+                val_len: 0,
+            };
+            self.append_entry(&entry, name.as_bytes(), &[], &[])
+        }
+
+        fn append_meta(&mut self, name: &str, key: &str, value: &str) -> Result<(), error::Error> {
+            self.append_kv_entry(EntryType::Meta, name, key, value)
+        }
+
+        fn append_kv_entry(
+            &mut self,
+            entry_type: EntryType,
+            name: &str,
+            key: &str,
+            value: &str,
+        ) -> Result<(), error::Error> {
+            let entry = EntryHeader {
+                state: ENTRY_STATE_LIVE,
+                entry_type: entry_type as u8,
+                name_len: u16::try_from(name.len())
+                    .map_err(|_| error::ErrorKind::InternalError("name too long".to_string()))?,
+                key_len: u16::try_from(key.len())
+                    .map_err(|_| error::ErrorKind::InternalError("key too long".to_string()))?,
+                val_len: u32::try_from(value.len())
+                    .map_err(|_| error::ErrorKind::InternalError("value too long".to_string()))?,
+            };
+            self.append_entry(&entry, name.as_bytes(), key.as_bytes(), value.as_bytes())
+        }
+
         fn ensure_mapped_size_from_header(&mut self) -> Result<(), error::Error> {
             let header = self.read_header()?;
             let declared = usize::try_from(header.total_size)
@@ -419,7 +564,7 @@ mod imp {
                     std::slice::from_raw_parts(p, nlen)
                 };
                 off += nlen;
-                let _key = unsafe {
+                let key = unsafe {
                     let p = self.ptr.as_ptr().add(off);
                     std::slice::from_raw_parts(p, klen)
                 };
@@ -441,6 +586,7 @@ mod imp {
                     state: e.state,
                     entry_type,
                     name: String::from_utf8_lossy(name).to_string(),
+                    key: String::from_utf8_lossy(key).to_string(),
                     val: val.to_vec(),
                 });
             }
@@ -478,6 +624,24 @@ mod imp {
             assert_eq!(region.get_scalar("x")?.as_deref(), Some("42"));
             region.unset_name("x")?;
             assert_eq!(region.get_scalar("x")?, None);
+            Ok(())
+        }
+
+        #[test]
+        fn typed_roundtrip() -> anyhow::Result<()> {
+            let mut region = SharedRegion::create(1024 * 1024)?;
+            let mut arr = std::collections::BTreeMap::new();
+            arr.insert(0, "a".to_string());
+            arr.insert(2, "c".to_string());
+            region.set_indexed_array("arr", &arr)?;
+            assert_eq!(region.get_meta("arr", "type")?.as_deref(), Some("array"));
+            assert_eq!(region.get_indexed_array("arr")?, arr);
+
+            let mut assoc = std::collections::BTreeMap::new();
+            assoc.insert("k".to_string(), "v".to_string());
+            region.set_assoc_array("cfg", &assoc)?;
+            assert_eq!(region.get_meta("cfg", "type")?.as_deref(), Some("assoc"));
+            assert_eq!(region.get_assoc_array("cfg")?, assoc);
             Ok(())
         }
 
@@ -536,6 +700,74 @@ mod imp {
     impl SharedRegion {
         /// Unsupported on this platform.
         pub fn create(_size: usize) -> Result<Self, error::Error> {
+            error::unimp("shared memory backend currently supports Linux only")
+        }
+
+        /// Unsupported on this platform.
+        pub fn set_scalar(&mut self, _name: &str, _value: &str) -> Result<(), error::Error> {
+            error::unimp("shared memory backend currently supports Linux only")
+        }
+
+        /// Unsupported on this platform.
+        pub fn get_scalar(&mut self, _name: &str) -> Result<Option<String>, error::Error> {
+            error::unimp("shared memory backend currently supports Linux only")
+        }
+
+        /// Unsupported on this platform.
+        pub fn unset_name(&mut self, _name: &str) -> Result<(), error::Error> {
+            error::unimp("shared memory backend currently supports Linux only")
+        }
+
+        /// Unsupported on this platform.
+        pub fn set_indexed_array(
+            &mut self,
+            _name: &str,
+            _values: &std::collections::BTreeMap<u64, String>,
+        ) -> Result<(), error::Error> {
+            error::unimp("shared memory backend currently supports Linux only")
+        }
+
+        /// Unsupported on this platform.
+        pub fn get_indexed_array(
+            &mut self,
+            _name: &str,
+        ) -> Result<std::collections::BTreeMap<u64, String>, error::Error> {
+            error::unimp("shared memory backend currently supports Linux only")
+        }
+
+        /// Unsupported on this platform.
+        pub fn set_assoc_array(
+            &mut self,
+            _name: &str,
+            _values: &std::collections::BTreeMap<String, String>,
+        ) -> Result<(), error::Error> {
+            error::unimp("shared memory backend currently supports Linux only")
+        }
+
+        /// Unsupported on this platform.
+        pub fn get_assoc_array(
+            &mut self,
+            _name: &str,
+        ) -> Result<std::collections::BTreeMap<String, String>, error::Error> {
+            error::unimp("shared memory backend currently supports Linux only")
+        }
+
+        /// Unsupported on this platform.
+        pub fn set_meta(
+            &mut self,
+            _name: &str,
+            _key: &str,
+            _value: &str,
+        ) -> Result<(), error::Error> {
+            error::unimp("shared memory backend currently supports Linux only")
+        }
+
+        /// Unsupported on this platform.
+        pub fn get_meta(
+            &mut self,
+            _name: &str,
+            _key: &str,
+        ) -> Result<Option<String>, error::Error> {
             error::unimp("shared memory backend currently supports Linux only")
         }
     }

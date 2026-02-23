@@ -80,3 +80,31 @@ fn shared_delete_unbinds_and_unsets_name() -> anyhow::Result<()> {
     assert_eq!(String::from_utf8(output.stdout)?, "gone\n");
     Ok(())
 }
+
+#[test]
+fn shared_indexed_array_visible_across_subshell() -> anyhow::Result<()> {
+    let output = run_script(
+        "shared -a arr; arr[0]=a; (arr[1]=b); printf '%s|%s' \"${arr[0]}\" \"${arr[1]}\"",
+    )?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?, "a|b");
+    Ok(())
+}
+
+#[test]
+fn shared_assoc_array_visible_across_subshell() -> anyhow::Result<()> {
+    let output = run_script(
+        "shared -A cfg; cfg[k]=v; (cfg[p]=q); printf '%s|%s' \"${cfg[k]}\" \"${cfg[p]}\"",
+    )?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?, "v|q");
+    Ok(())
+}
+
+#[test]
+fn shared_integer_preserves_integer_behavior() -> anyhow::Result<()> {
+    let output = run_script("shared -i n=1; (n=41; n+=1); echo \"$n\"")?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?, "42\n");
+    Ok(())
+}
