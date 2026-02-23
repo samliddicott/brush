@@ -50,6 +50,7 @@ mod imp {
         fn shared_del(&mut self, name: &str) -> PyResult<()>;
         fn shared_contains(&mut self, name: &str) -> PyResult<bool>;
         fn shared_keys(&mut self) -> PyResult<Vec<String>>;
+        fn stack_frames(&mut self) -> PyResult<Vec<(String, Option<usize>, String)>>;
         fn funcs_get_body(&mut self, name: &str) -> PyResult<String>;
         fn funcs_contains(&mut self, name: &str) -> PyResult<bool>;
         fn funcs_keys(&mut self) -> PyResult<Vec<String>>;
@@ -345,6 +346,21 @@ mod imp {
 
         fn shared_keys(&mut self) -> PyResult<Vec<String>> {
             Ok(self.shell().shared_bound_names())
+        }
+
+        fn stack_frames(&mut self) -> PyResult<Vec<(String, Option<usize>, String)>> {
+            let mut frames = Vec::new();
+            for frame in self.shell().call_stack().iter() {
+                let source = frame.current_pos_as_source_info().source;
+                let lineno = frame.current_line();
+                let funcname = if frame.frame_type.is_function() {
+                    frame.frame_type.name().to_string()
+                } else {
+                    "main".to_string()
+                };
+                frames.push((source, lineno, funcname));
+            }
+            Ok(frames)
         }
 
         fn funcs_get_body(&mut self, name: &str) -> PyResult<String> {
@@ -1320,6 +1336,12 @@ mod imp {
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
             .add_function(
+                pyo3::wrap_pyfunction!(brush_stack_frames, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
                 pyo3::wrap_pyfunction!(brush_funcs_get_body, &bridge_module)
                     .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
             )
@@ -1791,6 +1813,11 @@ mod imp {
     }
 
     #[pyfunction]
+    fn brush_stack_frames() -> PyResult<Vec<(String, Option<usize>, String)>> {
+        with_live_bridge(|bridge| bridge.stack_frames())
+    }
+
+    #[pyfunction]
     fn brush_funcs_get_body(name: String) -> PyResult<String> {
         with_live_bridge(|bridge| bridge.funcs_get_body(name.as_str()))
     }
@@ -1992,6 +2019,27 @@ class _BrushSharedMap:
     def __len__(self):
         return len(_brush_bridge.brush_shared_keys())
 
+class _BrushStackFrame:
+    __slots__ = ("source", "lineno", "funcname")
+
+    def __init__(self, source, lineno, funcname):
+        self.source = source
+        self.lineno = lineno
+        self.funcname = funcname
+
+class _BrushStackView:
+    def _frames(self):
+        return [_BrushStackFrame(source, lineno, funcname) for (source, lineno, funcname) in _brush_bridge.brush_stack_frames()]
+
+    def __iter__(self):
+        return iter(self._frames())
+
+    def __len__(self):
+        return len(_brush_bridge.brush_stack_frames())
+
+    def __getitem__(self, idx):
+        return self._frames()[idx]
+
 def _brush_raise_bash_error(args, result):
     err = RuntimeError("bash command failed")
     err.returncode = result["returncode"]
@@ -2059,6 +2107,7 @@ class _Brush:
         self.vars = _BrushVarsMap()
         self.env = _BrushEnvMap()
         self.shared = _BrushSharedMap()
+        self.stack = _BrushStackView()
         self.fn = _BrushFnMap()
         self.PIPE = "PIPE"
         self.STDOUT = "STDOUT"
