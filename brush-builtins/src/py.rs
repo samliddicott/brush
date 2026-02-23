@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use brush_core::{ExecutionExitCode, ExecutionResult, builtins};
+use brush_core::{ExecutionExitCode, ExecutionResult, ShellVariable, builtins};
 use clap::Parser;
 
 /// Execute Python code in the shell-embedded Python runtime.
@@ -21,13 +21,22 @@ impl builtins::Command for PyCommand {
         &self,
         mut context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
-        let Some(first) = self.args.first() else {
+        let options = match parse_options(&self.args) {
+            Ok(o) => o,
+            Err(()) => {
+                writeln!(context.stderr(), "py: invalid option usage")?;
+                return Ok(ExecutionExitCode::InvalidUsage.into());
+            }
+        };
+        let remaining = options.remaining;
+
+        let Some(first) = remaining.first() else {
             writeln!(context.stderr(), "py: expected arguments")?;
             return Ok(ExecutionExitCode::InvalidUsage.into());
         };
 
         if let Some((fd, close_after)) = parse_fd_spec(first) {
-            if self.args.len() != 1 {
+            if remaining.len() != 1 {
                 writeln!(
                     context.stderr(),
                     "py: fd mode expects exactly one argument (e.g. -5 or -5-)"
@@ -48,11 +57,126 @@ impl builtins::Command for PyCommand {
             }
 
             let dedented = dedent_text(&script);
-            return brush_core::python::exec_code(context.shell, &context.params, &dedented);
+            let py_options = brush_core::python::PyExecOptions {
+                expression_mode: options.expression_mode,
+                structured_exceptions: options.structured_exceptions,
+            };
+            let outcome =
+                brush_core::python::exec_code_with_options(context.shell, &dedented, py_options)?;
+            return finalize_outcome(&mut context, outcome, &options);
         }
 
-        brush_core::python::exec_unified(context.shell, &context.params, &self.args)
+        let py_options = brush_core::python::PyExecOptions {
+            expression_mode: options.expression_mode,
+            structured_exceptions: options.structured_exceptions,
+        };
+        let outcome = brush_core::python::exec_unified_with_options(
+            context.shell,
+            &context.params,
+            remaining,
+            py_options,
+        )?;
+        finalize_outcome(&mut context, outcome, &options)
     }
+}
+
+struct ParsedOptions<'a> {
+    expression_mode: bool,
+    structured_exceptions: bool,
+    capture_stdout_var: Option<String>,
+    capture_result_var: Option<String>,
+    remaining: &'a [String],
+}
+
+fn parse_options(args: &[String]) -> Result<ParsedOptions<'_>, ()> {
+    let mut expression_mode = false;
+    let mut structured_exceptions = false;
+    let mut capture_stdout_var: Option<String> = None;
+    let mut capture_result_var: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = &args[i];
+
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+
+        match arg.as_str() {
+            "-e" => {
+                expression_mode = true;
+                i += 1;
+            }
+            "-x" => {
+                structured_exceptions = true;
+                i += 1;
+            }
+            "-v" => {
+                let Some(var) = args.get(i + 1) else {
+                    return Err(());
+                };
+                capture_stdout_var = Some(var.clone());
+                i += 2;
+            }
+            "-r" => {
+                let Some(var) = args.get(i + 1) else {
+                    return Err(());
+                };
+                capture_result_var = Some(var.clone());
+                i += 2;
+            }
+            _ if arg.starts_with('-') => break,
+            _ => break,
+        }
+    }
+
+    Ok(ParsedOptions {
+        expression_mode,
+        structured_exceptions,
+        capture_stdout_var,
+        capture_result_var,
+        remaining: &args[i..],
+    })
+}
+
+fn finalize_outcome<SE: brush_core::ShellExtensions>(
+    context: &mut brush_core::ExecutionContext<'_, SE>,
+    outcome: brush_core::python::PyExecOutcome,
+    options: &ParsedOptions<'_>,
+) -> Result<ExecutionResult, brush_core::Error> {
+    if let Some(var) = &options.capture_stdout_var {
+        context
+            .shell
+            .env_mut()
+            .set_global(var, ShellVariable::new(outcome.stdout.clone()))?;
+    } else if !outcome.stdout.is_empty() {
+        write!(context.stdout(), "{}", outcome.stdout)?;
+    }
+
+    if let Some(var) = &options.capture_result_var {
+        if let Some(value) = &outcome.value {
+            context
+                .shell
+                .env_mut()
+                .set_global(var, ShellVariable::new(value.clone()))?;
+        } else {
+            context
+                .shell
+                .env_mut()
+                .set_global(var, ShellVariable::new(String::new()))?;
+        }
+    } else if let Some(value) = &outcome.value {
+        writeln!(context.stdout(), "{value}")?;
+    }
+
+    if options.structured_exceptions
+        && let Some(exc) = &outcome.exception
+    {
+        brush_core::python::apply_structured_exception(context.shell, exc)?;
+    }
+
+    Ok(outcome.result)
 }
 
 fn parse_fd_spec(s: &str) -> Option<(i32, bool)> {
@@ -114,7 +238,7 @@ fn dedent_text(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedent_text, parse_fd_spec};
+    use super::{dedent_text, parse_fd_spec, parse_options};
 
     #[test]
     fn parses_fd_specs() {
@@ -131,5 +255,24 @@ mod tests {
         let input = "    a\n      b\n    c\n";
         let output = dedent_text(input);
         assert_eq!(output, "a\n  b\nc\n");
+    }
+
+    #[test]
+    fn parses_options_and_rest() {
+        let args = vec![
+            "-x".to_string(),
+            "-e".to_string(),
+            "-v".to_string(),
+            "OUT".to_string(),
+            "-r".to_string(),
+            "RET".to_string(),
+            "expr".to_string(),
+        ];
+        let parsed = parse_options(&args).expect("options should parse");
+        assert!(parsed.expression_mode);
+        assert!(parsed.structured_exceptions);
+        assert_eq!(parsed.capture_stdout_var.as_deref(), Some("OUT"));
+        assert_eq!(parsed.capture_result_var.as_deref(), Some("RET"));
+        assert_eq!(parsed.remaining, ["expr"]);
     }
 }
