@@ -23,6 +23,7 @@ depends = "$auto"
 section = "shells"
 priority = "optional"
 assets = [
+    ["target/release/brush", "usr/bin/brush", "755"],
     ["../README.md", "usr/share/doc/brush-shell/README.md", "644"],
     ["../CHANGELOG.md", "usr/share/doc/brush-shell/changelog", "644"],
 ]

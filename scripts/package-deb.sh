@@ -2,7 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${repo_root}"
+crate_dir="${repo_root}/brush-shell"
+cd "${crate_dir}"
 
 if ! command -v cargo-deb >/dev/null 2>&1; then
   echo "error: cargo-deb is not installed." >&2
@@ -10,4 +11,4 @@ if ! command -v cargo-deb >/dev/null 2>&1; then
   exit 1
 fi
 
-exec cargo deb -p brush-shell "$@"
+exec cargo deb "$@"

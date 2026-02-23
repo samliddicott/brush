@@ -18,7 +18,7 @@ brush is a Rust-implemented shell focused on POSIX and bash compatibility.
 %autosetup -n %{name}-%{version}
 
 %build
-cargo build --release --locked -p brush-shell
+cargo build --release --locked -p brush-shell %{?cargo_features}
 
 %install
 install -Dpm0755 target/release/brush %{buildroot}%{_bindir}/brush
