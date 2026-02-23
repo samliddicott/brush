@@ -291,9 +291,18 @@ The shell `shared` builtin exposes shared backing directly from shell scripts:
 Concurrency notes:
 
 - shared storage is process-visible across shell forks/subshells
+- this includes subshell blocks `( ... )`, pipeline elements `a | b`, and background jobs `... &`
 - updates are serialized through shared-backend locking
 - visibility is immediate after writer completion
 - there is no multi-key transaction API; treat each assignment as an independent update
+
+Example:
+
+```bash
+shared x=0
+(x=42)
+echo "$x"   # 42
+```
 
 ## Exit and return code semantics
 
