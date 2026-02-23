@@ -52,7 +52,6 @@ default = [
     'builtin.printf',
     'builtin.pushd',
     'builtin.pwd',
-    'builtin.py',
     'builtin.read',
     'builtin.return',
     'builtin.set',
@@ -70,6 +69,8 @@ default = [
     'builtin.unset',
     'builtin.wait',
 ]
+
+python-pyo3 = ["brush-core/python-pyo3", "builtin.py"]
 
 'builtin.alias' = []
 'builtin.bg' = []

@@ -65,6 +65,7 @@ experimental-parser = [
     "brush-core/experimental-parser",
     "brush-parser/winnow-parser",
 ]
+python-pyo3 = ["brush-core/python-pyo3", "brush-builtins/python-pyo3"]
 schema = ["dep:schemars"]
 
 [lints]

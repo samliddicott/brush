@@ -20,6 +20,7 @@ workspace = true
 default = []
 serde = ["dep:serde", "brush-parser/serde", "rpds/serde", "chrono/serde"]
 experimental-parser = ["brush-parser/winnow-parser"]
+python-pyo3 = ["dep:pyo3"]
 
 [dependencies]
 async-recursion = "1.1.1"
@@ -38,7 +39,7 @@ itertools = "0.14.0"
 normalize-path = "0.2.1"
 rand = "0.10.0"
 rpds = "1.2.0"
-pyo3 = { version = "0.23.5", features = ["auto-initialize"] }
+pyo3 = { version = "0.23.5", features = ["auto-initialize"], optional = true }
 serde = { version = "1.0.228", optional = true, features = ["derive"] }
 strum = "0.27.2"
 strum_macros = "0.27.2"

@@ -181,6 +181,8 @@ pub struct RuntimeOptions {
     pub shift_verbose: bool,
     /// `sourcepath`
     pub source_builtin_searches_path: bool,
+    /// `threaded_mode`; when false, shell should prefer forked execution backends.
+    pub threaded_mode: bool,
     /// `varredir_close`
     pub var_redir_close: bool,
     /// `xpg_echo`
@@ -238,6 +240,7 @@ impl RuntimeOptions {
             interactive_comments: true,
             expand_prompt_strings: true,
             source_builtin_searches_path: true,
+            threaded_mode: true,
             perform_brace_expansion: true,
             quote_all_metachars_in_completion: true,
             programmable_completion: true,

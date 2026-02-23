@@ -658,6 +658,13 @@ static SHOPT_OPTIONS: LazyLock<HashMap<&'static str, ShellOptionDef>> = LazyLock
             ),
         ),
         (
+            "forked_mode",
+            ShellOptionDef::new(
+                |options| !options.threaded_mode,
+                |options, value| options.threaded_mode = !value,
+            ),
+        ),
+        (
             "globasciiranges",
             ShellOptionDef::new(
                 |options| options.glob_ranges_use_c_locale,
@@ -858,6 +865,13 @@ static SHOPT_OPTIONS: LazyLock<HashMap<&'static str, ShellOptionDef>> = LazyLock
             ShellOptionDef::new(
                 |options| options.source_builtin_searches_path,
                 |options, value| options.source_builtin_searches_path = value,
+            ),
+        ),
+        (
+            "threaded_mode",
+            ShellOptionDef::new(
+                |options| options.threaded_mode,
+                |options, value| options.threaded_mode = value,
             ),
         ),
         (
