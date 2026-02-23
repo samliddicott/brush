@@ -6,8 +6,9 @@ pub use shell_builder::State as ShellBuilderState;
 
 use super::Shell;
 use crate::{
-    ProfileLoadBehavior, RcLoadBehavior, ShellFd, ShellVariable, builtins, callstack, completion,
-    env, error, extensions, functions, jobs, openfiles, options, pathcache,
+    ProfileLoadBehavior, RcLoadBehavior, ShellFd, ShellVariable, builtins, callstack,
+    cancel::CancellationToken, completion, env, error, extensions, functions, jobs, openfiles,
+    options, pathcache, python::PythonContext,
     shell::KeyBindingsHelper, traps,
 };
 
@@ -236,6 +237,9 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             env: env::ShellEnvironment::default(),
             funcs: functions::FunctionEnv::default(),
             options: options::RuntimeOptions::default(),
+            python: PythonContext::default(),
+            cancel: CancellationToken::default(),
+            context_mode: super::ContextMode::Parent,
             jobs: jobs::JobManager::default(),
             aliases: HashMap::default(),
             last_exit_status: 0,

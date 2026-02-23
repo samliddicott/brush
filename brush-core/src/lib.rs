@@ -5,6 +5,7 @@ pub mod arithmetic;
 mod braceexpansion;
 pub mod builtins;
 pub mod callstack;
+pub mod cancel;
 pub mod commands;
 pub mod completion;
 pub mod env;
@@ -28,6 +29,7 @@ pub mod pathcache;
 pub mod pathsearch;
 pub mod patterns;
 pub mod processes;
+pub mod python;
 mod prompt;
 mod regex;
 pub mod results;
@@ -51,14 +53,16 @@ pub mod parser {
 }
 
 pub use commands::{CommandArg, ExecutionContext};
+pub use cancel::CancellationToken;
 pub use error::{BuiltinError, Error, ErrorKind};
 pub use extensions::ShellExtensions;
 pub use interp::{ExecutionParameters, ProcessGroupPolicy};
+pub use python::PythonContext;
 pub use parser::{SourcePosition, SourcePositionOffset, SourceSpan};
 pub use results::{ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ExecutionSpawnResult};
 pub use shell::{
-    CreateOptions, ProfileLoadBehavior, RcLoadBehavior, Shell, ShellBuilder, ShellBuilderState,
-    ShellFd, ShellState,
+    ContextMode, CreateOptions, ProfileLoadBehavior, RcLoadBehavior, Shell, ShellBuilder,
+    ShellBuilderState, ShellFd, ShellState,
 };
 pub use sourceinfo::SourceInfo;
 pub use variables::{ShellValue, ShellVariable};

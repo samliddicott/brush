@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::{
-    completion, env::ShellEnvironment, jobs, openfiles, options::RuntimeOptions, pathcache,
+    cancel::CancellationToken, completion, env::ShellEnvironment, jobs, openfiles,
+    options::RuntimeOptions, pathcache, python::PythonContext, shell::ContextMode,
     shell::KeyBindingsHelper,
 };
 
@@ -33,6 +34,18 @@ pub trait ShellState {
 
     /// Returns a mutable reference to the shell's runtime options.
     fn options_mut(&mut self) -> &mut RuntimeOptions;
+
+    /// Returns the shell's Python runtime context.
+    fn python(&self) -> &PythonContext;
+
+    /// Returns a mutable reference to the shell's Python runtime context.
+    fn python_mut(&mut self) -> &mut PythonContext;
+
+    /// Returns the shell's cooperative cancellation token.
+    fn cancel(&self) -> &CancellationToken;
+
+    /// Returns whether this shell is a parent or isolated context.
+    fn context_mode(&self) -> ContextMode;
 
     /// Returns the shell's aliases.
     fn aliases(&self) -> &HashMap<String, String>;

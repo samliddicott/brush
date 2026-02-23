@@ -8,9 +8,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::{
-    ExecutionControlFlow, ExecutionResult, builtins, env::ShellEnvironment, error, extensions,
-    functions, interfaces, jobs, keywords, openfiles, options::RuntimeOptions, pathcache,
-    wellknownvars,
+    ExecutionControlFlow, ExecutionResult, builtins, cancel::CancellationToken,
+    env::ShellEnvironment, error, extensions, functions, interfaces, jobs, keywords, openfiles,
+    options::RuntimeOptions, pathcache, python::PythonContext, wellknownvars,
 };
 
 /// Type for storing a key bindings helper.
@@ -48,6 +48,17 @@ pub use builder::{CreateOptions, ShellBuilder, ShellBuilderState};
 pub use initscripts::{ProfileLoadBehavior, RcLoadBehavior};
 pub use state::ShellState;
 
+/// Indicates whether a shell context is a parent (root) context or an isolated clone.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ContextMode {
+    /// Root/parent shell context.
+    #[default]
+    Parent,
+    /// Isolated shell context created for subshell-like execution.
+    Isolated,
+}
+
 /// Represents an instance of a shell.
 ///
 /// # Type Parameters
@@ -79,6 +90,17 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 
     /// Runtime shell options.
     options: RuntimeOptions,
+
+    /// Embedded Python runtime context.
+    #[cfg_attr(feature = "serde", serde(skip, default))]
+    python: PythonContext,
+
+    /// Cooperative cancellation token for this shell context.
+    #[cfg_attr(feature = "serde", serde(skip, default))]
+    cancel: CancellationToken,
+
+    /// Indicates whether this shell represents the parent/root or an isolated context.
+    context_mode: ContextMode,
 
     /// State of managed jobs.
     /// TODO(serde): Need to warn somehow that jobs cannot be serialized.
@@ -156,6 +178,9 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             env: self.env.clone(),
             funcs: self.funcs.clone(),
             options: self.options.clone(),
+            python: self.python.clone(),
+            cancel: CancellationToken::new(),
+            context_mode: ContextMode::Isolated,
             jobs: jobs::JobManager::new(),
             aliases: self.aliases.clone(),
             last_exit_status: self.last_exit_status,
@@ -208,6 +233,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             error_formatter: options.error_formatter,
             open_files: openfiles::OpenFiles::new(),
             options: runtime_options,
+            python: PythonContext::defaults_for_interactive(options.interactive),
             name: options.shell_name,
             args: options.shell_args.unwrap_or_default(),
             version: options.shell_version,
@@ -347,6 +373,26 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
     /// Returns a mutable reference to the shell's runtime options.
     pub fn options_mut(&mut self) -> &mut RuntimeOptions {
         &mut self.options
+    }
+
+    /// Returns the shell's Python runtime context.
+    pub fn python(&self) -> &PythonContext {
+        &self.python
+    }
+
+    /// Returns a mutable reference to the shell's Python runtime context.
+    pub fn python_mut(&mut self) -> &mut PythonContext {
+        &mut self.python
+    }
+
+    /// Returns the shell's cancellation token.
+    pub fn cancel(&self) -> &CancellationToken {
+        &self.cancel
+    }
+
+    /// Returns the shell context mode.
+    pub fn context_mode(&self) -> ContextMode {
+        self.context_mode
     }
 
     /// Returns the shell's aliases.
