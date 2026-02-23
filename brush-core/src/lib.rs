@@ -33,6 +33,7 @@ pub mod python;
 mod prompt;
 mod regex;
 pub mod results;
+pub mod shared_memory;
 mod shell;
 pub mod sourceinfo;
 pub mod sys;
