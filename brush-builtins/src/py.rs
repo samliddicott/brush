@@ -30,6 +30,39 @@ impl builtins::Command for PyCommand {
         };
         let remaining = options.remaining;
 
+        if let Some(name) = &options.tie_var {
+            if !remaining.is_empty() {
+                writeln!(context.stderr(), "py: -t expects only a variable name")?;
+                return Ok(ExecutionExitCode::InvalidUsage.into());
+            }
+
+            let q = python_quote_single(name);
+            let code = format!(
+                "bash.tie({q}, lambda: globals().get({q}, ''), lambda v: globals().__setitem__({q}, v))"
+            );
+            let outcome = brush_core::python::exec_code_with_options(
+                context.shell,
+                &code,
+                brush_core::python::PyExecOptions::default(),
+            )?;
+            return finalize_outcome(&mut context, outcome, &options);
+        }
+
+        if let Some(name) = &options.untie_var {
+            if !remaining.is_empty() {
+                writeln!(context.stderr(), "py: -u expects only a variable name")?;
+                return Ok(ExecutionExitCode::InvalidUsage.into());
+            }
+
+            let code = format!("bash.untie({})", python_quote_single(name));
+            let outcome = brush_core::python::exec_code_with_options(
+                context.shell,
+                &code,
+                brush_core::python::PyExecOptions::default(),
+            )?;
+            return finalize_outcome(&mut context, outcome, &options);
+        }
+
         let Some(first) = remaining.first() else {
             writeln!(context.stderr(), "py: expected arguments")?;
             return Ok(ExecutionExitCode::InvalidUsage.into());
@@ -85,6 +118,8 @@ struct ParsedOptions<'a> {
     structured_exceptions: bool,
     capture_stdout_var: Option<String>,
     capture_result_var: Option<String>,
+    tie_var: Option<String>,
+    untie_var: Option<String>,
     remaining: &'a [String],
 }
 
@@ -93,6 +128,8 @@ fn parse_options(args: &[String]) -> Result<ParsedOptions<'_>, ()> {
     let mut structured_exceptions = false;
     let mut capture_stdout_var: Option<String> = None;
     let mut capture_result_var: Option<String> = None;
+    let mut tie_var: Option<String> = None;
+    let mut untie_var: Option<String> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -126,9 +163,27 @@ fn parse_options(args: &[String]) -> Result<ParsedOptions<'_>, ()> {
                 capture_result_var = Some(var.clone());
                 i += 2;
             }
+            "-t" => {
+                let Some(var) = args.get(i + 1) else {
+                    return Err(());
+                };
+                tie_var = Some(var.clone());
+                i += 2;
+            }
+            "-u" => {
+                let Some(var) = args.get(i + 1) else {
+                    return Err(());
+                };
+                untie_var = Some(var.clone());
+                i += 2;
+            }
             _ if arg.starts_with('-') => break,
             _ => break,
         }
+    }
+
+    if tie_var.is_some() && untie_var.is_some() {
+        return Err(());
     }
 
     Ok(ParsedOptions {
@@ -136,8 +191,14 @@ fn parse_options(args: &[String]) -> Result<ParsedOptions<'_>, ()> {
         structured_exceptions,
         capture_stdout_var,
         capture_result_var,
+        tie_var,
+        untie_var,
         remaining: &args[i..],
     })
+}
+
+fn python_quote_single(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 fn finalize_outcome<SE: brush_core::ShellExtensions>(
@@ -273,6 +334,23 @@ mod tests {
         assert!(parsed.structured_exceptions);
         assert_eq!(parsed.capture_stdout_var.as_deref(), Some("OUT"));
         assert_eq!(parsed.capture_result_var.as_deref(), Some("RET"));
+        assert_eq!(parsed.tie_var, None);
+        assert_eq!(parsed.untie_var, None);
         assert_eq!(parsed.remaining, ["expr"]);
+    }
+
+    #[test]
+    fn parses_tie_and_untie_options() {
+        let t = vec!["-t".to_string(), "x".to_string()];
+        let parsed_t = parse_options(&t).expect("tie options should parse");
+        assert_eq!(parsed_t.tie_var.as_deref(), Some("x"));
+        assert_eq!(parsed_t.untie_var, None);
+        assert!(parsed_t.remaining.is_empty());
+
+        let u = vec!["-u".to_string(), "x".to_string()];
+        let parsed_u = parse_options(&u).expect("untie options should parse");
+        assert_eq!(parsed_u.tie_var, None);
+        assert_eq!(parsed_u.untie_var.as_deref(), Some("x"));
+        assert!(parsed_u.remaining.is_empty());
     }
 }

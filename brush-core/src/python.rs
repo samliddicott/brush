@@ -1503,24 +1503,85 @@ mod imp {
     }
 
     const BASH_BRIDGE_BOOTSTRAP: &str = r#"
+class _BrushTies:
+    def __init__(self):
+        self._items = {}
+
+    def tie(self, name, getter, setter=None, type=None):
+        if not callable(getter):
+            raise TypeError("getter must be callable")
+        if setter is not None and not callable(setter):
+            raise TypeError("setter must be callable")
+        self._items[name] = (getter, setter, type)
+
+    def untie(self, name):
+        self._items.pop(name, None)
+
+    def has(self, name):
+        return name in self._items
+
+    def get(self, name):
+        return self._items.get(name)
+
+    def names(self):
+        return list(self._items.keys())
+
+try:
+    _brush_ties
+except NameError:
+    _brush_ties = _BrushTies()
+
+def _brush_coerce_tie_value(name, value, tie_type):
+    if tie_type is None:
+        return value
+    if tie_type == "scalar":
+        return "" if value is None else str(value)
+    if tie_type == "integer":
+        return int(value)
+    if tie_type == "array":
+        return list(value)
+    if tie_type == "assoc":
+        return dict(value)
+    raise ValueError(f"unsupported tie type for {name}: {tie_type}")
+
+def _brush_sync_tied_value(name):
+    tie = _brush_ties.get(name)
+    if tie is None:
+        return None
+    getter, _setter, tie_type = tie
+    value = _brush_coerce_tie_value(name, getter(), tie_type)
+    _brush_bridge.brush_vars_set(name, value)
+    return value
+
 class _BrushVarsMap:
     def __getitem__(self, name):
+        if _brush_ties.has(name):
+            return _brush_sync_tied_value(name)
         return _brush_bridge.brush_vars_get(name)
 
     def __setitem__(self, name, value):
+        if _brush_ties.has(name):
+            getter, setter, tie_type = _brush_ties.get(name)
+            if setter is None:
+                raise RuntimeError(f"tied variable '{name}' is read-only")
+            setter(value)
+            _brush_bridge.brush_vars_set(name, _brush_coerce_tie_value(name, getter(), tie_type))
+            return
         _brush_bridge.brush_vars_set(name, value)
 
     def __delitem__(self, name):
+        if _brush_ties.has(name):
+            _brush_ties.untie(name)
         _brush_bridge.brush_vars_del(name)
 
     def __contains__(self, name):
-        return _brush_bridge.brush_vars_contains(name)
+        return _brush_ties.has(name) or _brush_bridge.brush_vars_contains(name)
 
     def __iter__(self):
-        return iter(_brush_bridge.brush_vars_keys())
+        return iter(set(_brush_bridge.brush_vars_keys()) | set(_brush_ties.names()))
 
     def __len__(self):
-        return len(_brush_bridge.brush_vars_keys())
+        return len(set(_brush_bridge.brush_vars_keys()) | set(_brush_ties.names()))
 
     def attrs(self, name):
         return set(_brush_bridge.brush_vars_attrs(name))
@@ -1656,6 +1717,13 @@ class _Brush:
             err.stderr = completed.stderr
             raise err
         return completed
+
+    def tie(self, name, getter, setter=None, type=None):
+        _brush_ties.tie(name, getter, setter, type)
+        _brush_sync_tied_value(name)
+
+    def untie(self, name):
+        _brush_ties.untie(name)
 
 bash = _Brush()
 "#;
