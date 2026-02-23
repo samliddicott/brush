@@ -2,13 +2,16 @@
 
 #[cfg(feature = "python-pyo3")]
 mod imp {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::collections::HashSet;
-    use std::cell::RefCell;
     use std::io::Write;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
-    use pyo3::prelude::*;
     use pyo3::exceptions::{PyKeyError, PyRuntimeError};
+    use pyo3::prelude::*;
     use pyo3::types::{PyAny, PyBool, PyDict, PyList, PyModule, PyTuple};
 
     use crate::{
@@ -45,6 +48,34 @@ mod imp {
         fn env_del(&mut self, name: &str) -> PyResult<()>;
         fn env_contains(&mut self, name: &str) -> PyResult<bool>;
         fn env_keys(&mut self) -> PyResult<Vec<String>>;
+        fn run_command(&mut self, py: Python<'_>, req: &RunRequest) -> PyResult<RunOutcome>;
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StdioSpec {
+        Inherit,
+        Pipe,
+        Stdout,
+        DevNull,
+    }
+
+    struct RunRequest {
+        args: Vec<String>,
+        shell: bool,
+        capture_output: bool,
+        stdout: StdioSpec,
+        stderr: StdioSpec,
+        input: Option<Vec<u8>>,
+        timeout: Option<f64>,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+    }
+
+    struct RunOutcome {
+        returncode: u8,
+        stdout: String,
+        stderr: String,
+        args: Vec<String>,
     }
 
     struct ShellLiveBridge<SE: extensions::ShellExtensions> {
@@ -74,7 +105,8 @@ mod imp {
         }
 
         fn vars_set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
-            let mut var = ShellVariable::new(py_any_to_shell_value(value).map_err(to_py_runtime_error)?);
+            let mut var =
+                ShellVariable::new(py_any_to_shell_value(value).map_err(to_py_runtime_error)?);
 
             if let Some(existing) = self.shell().env_var(name) {
                 preserve_attrs_from_existing(existing, &mut var).map_err(to_py_runtime_error)?;
@@ -87,7 +119,11 @@ mod imp {
         }
 
         fn vars_del(&mut self, name: &str) -> PyResult<()> {
-            let _ = self.shell_mut().env_mut().unset(name).map_err(to_py_runtime_error)?;
+            let _ = self
+                .shell_mut()
+                .env_mut()
+                .unset(name)
+                .map_err(to_py_runtime_error)?;
             Ok(())
         }
 
@@ -166,7 +202,8 @@ mod imp {
         }
 
         fn env_set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
-            let mut var = ShellVariable::new(py_any_to_shell_value(value).map_err(to_py_runtime_error)?);
+            let mut var =
+                ShellVariable::new(py_any_to_shell_value(value).map_err(to_py_runtime_error)?);
             var.export();
             self.shell_mut()
                 .env_mut()
@@ -175,7 +212,11 @@ mod imp {
         }
 
         fn env_del(&mut self, name: &str) -> PyResult<()> {
-            let _ = self.shell_mut().env_mut().unset(name).map_err(to_py_runtime_error)?;
+            let _ = self
+                .shell_mut()
+                .env_mut()
+                .unset(name)
+                .map_err(to_py_runtime_error)?;
             Ok(())
         }
 
@@ -193,6 +234,263 @@ mod imp {
                 .iter_exported()
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>())
+        }
+
+        fn run_command(&mut self, _py: Python<'_>, req: &RunRequest) -> PyResult<RunOutcome> {
+            let command = build_command_string(req);
+            let needs_child = req.shell
+                || req.capture_output
+                || req.stdout == StdioSpec::Pipe
+                || req.stdout == StdioSpec::DevNull
+                || req.stderr == StdioSpec::Pipe
+                || req.stderr == StdioSpec::Stdout
+                || req.stderr == StdioSpec::DevNull
+                || req.input.is_some()
+                || req.timeout.is_some();
+
+            if needs_child {
+                self.run_in_child(req, command.as_str())
+            } else {
+                self.run_in_current(req, command.as_str())
+            }
+        }
+    }
+
+    impl<SE: extensions::ShellExtensions> ShellLiveBridge<SE> {
+        fn run_in_current(&mut self, req: &RunRequest, command: &str) -> PyResult<RunOutcome> {
+            let mut params = self.shell().default_exec_params();
+            let mut stdout_reader = None::<std::io::PipeReader>;
+            let mut stderr_reader = None::<std::io::PipeReader>;
+
+            if req.capture_output || req.stdout == StdioSpec::Pipe {
+                let (r, w) = std::io::pipe().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                params.set_fd(crate::openfiles::OpenFiles::STDOUT_FD, w.into());
+                stdout_reader = Some(r);
+            } else if req.stdout == StdioSpec::DevNull {
+                params.set_fd(
+                    crate::openfiles::OpenFiles::STDOUT_FD,
+                    crate::openfiles::null().map_err(to_py_runtime_error)?,
+                );
+            }
+
+            if req.capture_output || req.stderr == StdioSpec::Pipe {
+                let (r, w) = std::io::pipe().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, w.into());
+                stderr_reader = Some(r);
+            } else if req.stderr == StdioSpec::Stdout {
+                if let Some(stdout_file) = params
+                    .try_fd(self.shell(), crate::openfiles::OpenFiles::STDOUT_FD)
+                    .and_then(|f| f.try_clone().ok())
+                {
+                    params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, stdout_file);
+                }
+            } else if req.stderr == StdioSpec::DevNull {
+                params.set_fd(
+                    crate::openfiles::OpenFiles::STDERR_FD,
+                    crate::openfiles::null().map_err(to_py_runtime_error)?,
+                );
+            }
+
+            let stdout_join = spawn_reader(stdout_reader);
+            let stderr_join = spawn_reader(stderr_reader);
+
+            let source = crate::SourceInfo::from("python-bridge");
+            let result = tokio::task::block_in_place(|| {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(
+                    self.shell_mut()
+                        .run_string(command.to_string(), &source, &params),
+                )
+            })
+            .map_err(to_py_runtime_error)?;
+
+            drop(params);
+            let stdout = join_reader(stdout_join)?;
+            let stderr = join_reader(stderr_join)?;
+
+            Ok(RunOutcome {
+                returncode: result.exit_code.into(),
+                stdout,
+                stderr,
+                args: req.args.clone(),
+            })
+        }
+
+        fn run_in_child(&mut self, req: &RunRequest, command: &str) -> PyResult<RunOutcome> {
+            let mut subshell = self.shell().clone();
+            let mut params = subshell.default_exec_params();
+            params.process_group_policy = crate::ProcessGroupPolicy::SameProcessGroup;
+
+            let mut stdout_reader = None::<std::io::PipeReader>;
+            let mut stderr_reader = None::<std::io::PipeReader>;
+
+            if req.capture_output || req.stdout == StdioSpec::Pipe {
+                let (r, w) = std::io::pipe().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                params.set_fd(crate::openfiles::OpenFiles::STDOUT_FD, w.into());
+                stdout_reader = Some(r);
+            } else if req.stdout == StdioSpec::DevNull {
+                params.set_fd(
+                    crate::openfiles::OpenFiles::STDOUT_FD,
+                    crate::openfiles::null().map_err(to_py_runtime_error)?,
+                );
+            }
+
+            if req.capture_output || req.stderr == StdioSpec::Pipe {
+                let (r, w) = std::io::pipe().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, w.into());
+                stderr_reader = Some(r);
+            } else if req.stderr == StdioSpec::Stdout {
+                if let Some(stdout_file) = params
+                    .try_fd(&subshell, crate::openfiles::OpenFiles::STDOUT_FD)
+                    .and_then(|f| f.try_clone().ok())
+                {
+                    params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, stdout_file);
+                }
+            } else if req.stderr == StdioSpec::DevNull {
+                params.set_fd(
+                    crate::openfiles::OpenFiles::STDERR_FD,
+                    crate::openfiles::null().map_err(to_py_runtime_error)?,
+                );
+            }
+
+            let mut stdin_writer = None::<std::io::PipeWriter>;
+            if req.input.is_some() {
+                let (r, w) = std::io::pipe().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                params.set_fd(crate::openfiles::OpenFiles::STDIN_FD, r.into());
+                stdin_writer = Some(w);
+            }
+
+            let stdout_join = spawn_reader(stdout_reader);
+            let stderr_join = spawn_reader(stderr_reader);
+            let input_join = if let (Some(mut w), Some(input)) = (stdin_writer, req.input.clone()) {
+                Some(thread::spawn(move || {
+                    let _ = w.write_all(&input);
+                    let _ = w.flush();
+                }))
+            } else {
+                None
+            };
+
+            let cancel = subshell.cancel().clone();
+            let command = command.to_string();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                let run_result = match rt {
+                    Ok(rt) => {
+                        let source = crate::SourceInfo::from("python-bridge-child");
+                        rt.block_on(subshell.run_string(command, &source, &params))
+                    }
+                    Err(e) => Err(error::ErrorKind::InternalError(e.to_string()).into()),
+                };
+                let _ = tx.send(run_result);
+            });
+
+            let result = if let Some(timeout) = req.timeout {
+                let wait = Duration::from_secs_f64(timeout.max(0.0));
+                match rx.recv_timeout(wait) {
+                    Ok(v) => v,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        cancel.cancel();
+                        return Err(PyRuntimeError::new_err("bash.run timeout expired"));
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(PyRuntimeError::new_err("child shell failed"));
+                    }
+                }
+            } else {
+                rx.recv()
+                    .map_err(|_| PyRuntimeError::new_err("child shell failed"))?
+            }
+            .map_err(to_py_runtime_error)?;
+
+            if let Some(j) = input_join {
+                let _ = j.join();
+            }
+            let stdout = join_reader(stdout_join)?;
+            let stderr = join_reader(stderr_join)?;
+
+            Ok(RunOutcome {
+                returncode: result.exit_code.into(),
+                stdout,
+                stderr,
+                args: req.args.clone(),
+            })
+        }
+    }
+
+    fn spawn_reader(reader: Option<std::io::PipeReader>) -> Option<thread::JoinHandle<String>> {
+        reader.map(|mut r| {
+            thread::spawn(move || {
+                let mut buf = Vec::<u8>::new();
+                let _ = std::io::Read::read_to_end(&mut r, &mut buf);
+                String::from_utf8_lossy(&buf).to_string()
+            })
+        })
+    }
+
+    fn join_reader(join: Option<thread::JoinHandle<String>>) -> PyResult<String> {
+        if let Some(j) = join {
+            j.join()
+                .map_err(|_| PyRuntimeError::new_err("reader thread failed"))
+        } else {
+            Ok(String::new())
+        }
+    }
+
+    fn shell_escape_single(s: &str) -> String {
+        if s.is_empty() {
+            return "''".to_string();
+        }
+        let escaped = s.replace('\'', "'\"'\"'");
+        format!("'{escaped}'")
+    }
+
+    fn build_command_string(req: &RunRequest) -> String {
+        let mut prefix_parts = Vec::<String>::new();
+        if let Some(cwd) = &req.cwd {
+            prefix_parts.push(format!("cd {} || exit $?", shell_escape_single(cwd)));
+        }
+        if req.shell && !req.env.is_empty() {
+            let exports = req
+                .env
+                .iter()
+                .map(|(k, v)| format!("export {k}={}", shell_escape_single(v)))
+                .collect::<Vec<_>>()
+                .join("; ");
+            prefix_parts.push(exports);
+        }
+
+        let base = if req.shell {
+            req.args.join(" ")
+        } else {
+            let mut iter = req.args.iter();
+            let Some(first) = iter.next() else {
+                return String::new();
+            };
+            let mut cmd = shell_escape_single(first);
+            if !req.env.is_empty() {
+                let assigns = req
+                    .env
+                    .iter()
+                    .map(|(k, v)| format!("{k}={}", shell_escape_single(v)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                cmd = format!("{assigns} {cmd}");
+            }
+            for a in iter {
+                cmd.push(' ');
+                cmd.push_str(shell_escape_single(a).as_str());
+            }
+            cmd
+        };
+
+        if prefix_parts.is_empty() {
+            base
+        } else {
+            format!("{}; {base}", prefix_parts.join("; "))
         }
     }
 
@@ -447,9 +745,8 @@ mod imp {
                 }
             };
 
-            let (stdout, run_result) = with_active_bridge(&mut bridge, || {
-                run_with_stdout_capture(py, run)
-            })?;
+            let (stdout, run_result) =
+                with_active_bridge(&mut bridge, || run_with_stdout_capture(py, run))?;
 
             match run_result {
                 Ok(value) => Ok(Some(PyExecOutcome {
@@ -517,9 +814,8 @@ mod imp {
                 }
             };
 
-            let (stdout, run_result) = with_active_bridge(&mut bridge, || {
-                run_with_stdout_capture(py, run)
-            })?;
+            let (stdout, run_result) =
+                with_active_bridge(&mut bridge, || run_with_stdout_capture(py, run))?;
 
             match run_result {
                 Ok(value) => Ok(PyExecOutcome {
@@ -678,19 +974,22 @@ mod imp {
         let bridge_module = PyModule::new(py, "_brush_bridge")
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_vars_get, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_vars_get, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_vars_set, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_vars_set, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_vars_del, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_vars_del, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
             .add_function(
@@ -699,14 +998,16 @@ mod imp {
             )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_vars_keys, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_vars_keys, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_vars_attrs, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_vars_attrs, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
             .add_function(
@@ -715,34 +1016,52 @@ mod imp {
             )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_vars_declare, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_vars_declare, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_env_get, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_env_get, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_env_set, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_env_set, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_env_del, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_env_del, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_env_contains, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_env_contains, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
-            .add_function(pyo3::wrap_pyfunction!(brush_env_keys, &bridge_module).map_err(
-                |e| error::ErrorKind::InternalError(e.to_string()),
-            )?)
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_env_keys, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_call, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_run, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
 
         globals
@@ -932,7 +1251,9 @@ mod imp {
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()).into())
     }
 
-    fn kwargs_to_attrs(kwargs: Option<&Bound<'_, PyDict>>) -> Result<HashSet<String>, error::Error> {
+    fn kwargs_to_attrs(
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> Result<HashSet<String>, error::Error> {
         let mut attrs_set = HashSet::new();
         apply_kwargs_to_attrs(&mut attrs_set, kwargs)?;
         Ok(attrs_set)
@@ -1017,6 +1338,48 @@ mod imp {
         Ok(())
     }
 
+    fn extract_args(any: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+        if let Ok(s) = any.extract::<String>() {
+            return Ok(vec![s]);
+        }
+        if let Ok(v) = any.extract::<Vec<String>>() {
+            return Ok(v);
+        }
+        if let Ok(tuple) = any.downcast::<PyTuple>() {
+            let mut out = Vec::with_capacity(tuple.len());
+            for item in tuple.iter() {
+                out.push(
+                    item.extract::<String>()
+                        .map_err(|_| PyRuntimeError::new_err("args must be strings"))?,
+                );
+            }
+            return Ok(out);
+        }
+        Err(PyRuntimeError::new_err("args must be str or sequence[str]"))
+    }
+
+    fn parse_stdio_spec(spec: Option<String>, default: StdioSpec) -> PyResult<StdioSpec> {
+        match spec.as_deref() {
+            None => Ok(default),
+            Some("PIPE") => Ok(StdioSpec::Pipe),
+            Some("STDOUT") => Ok(StdioSpec::Stdout),
+            Some("DEVNULL") => Ok(StdioSpec::DevNull),
+            Some("INHERIT") => Ok(StdioSpec::Inherit),
+            Some(other) => Err(PyRuntimeError::new_err(format!(
+                "invalid stdio spec: {other}"
+            ))),
+        }
+    }
+
+    fn run_outcome_to_py_dict(py: Python<'_>, out: RunOutcome) -> PyResult<PyObject> {
+        let d = PyDict::new(py);
+        d.set_item("returncode", out.returncode)?;
+        d.set_item("stdout", out.stdout)?;
+        d.set_item("stderr", out.stderr)?;
+        d.set_item("args", out.args)?;
+        Ok(d.unbind().into())
+    }
+
     #[pyfunction]
     fn brush_vars_get(py: Python<'_>, name: String) -> PyResult<PyObject> {
         with_live_bridge(|bridge| bridge.vars_get(py, name.as_str()))
@@ -1093,6 +1456,88 @@ mod imp {
         with_live_bridge(|bridge| bridge.env_keys())
     }
 
+    #[pyfunction]
+    fn brush_call(py: Python<'_>, args: Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let args = extract_args(&args)?;
+        let req = RunRequest {
+            args,
+            shell: false,
+            capture_output: true,
+            stdout: StdioSpec::Pipe,
+            stderr: StdioSpec::Pipe,
+            input: None,
+            timeout: None,
+            cwd: None,
+            env: Vec::new(),
+        };
+        let out = with_live_bridge(|bridge| bridge.run_command(py, &req))?;
+        run_outcome_to_py_dict(py, out)
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (args, capture_output=false, stdout=None, stderr=None, check=false, input=None, shell=false, timeout=None, cwd=None, env=None))]
+    fn brush_run(
+        py: Python<'_>,
+        args: Bound<'_, PyAny>,
+        capture_output: bool,
+        stdout: Option<String>,
+        stderr: Option<String>,
+        check: bool,
+        input: Option<Bound<'_, PyAny>>,
+        shell: bool,
+        timeout: Option<f64>,
+        cwd: Option<String>,
+        env: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        let args = extract_args(&args)?;
+        let stdout_spec = if capture_output {
+            StdioSpec::Pipe
+        } else {
+            parse_stdio_spec(stdout, StdioSpec::Inherit)?
+        };
+        let stderr_spec = if capture_output {
+            StdioSpec::Pipe
+        } else {
+            parse_stdio_spec(stderr, StdioSpec::Inherit)?
+        };
+
+        let input_bytes = if let Some(input) = input {
+            if let Ok(s) = input.extract::<String>() {
+                Some(s.into_bytes())
+            } else if let Ok(b) = input.extract::<Vec<u8>>() {
+                Some(b)
+            } else {
+                return Err(PyRuntimeError::new_err("input must be str or bytes"));
+            }
+        } else {
+            None
+        };
+
+        let mut env_pairs = Vec::<(String, String)>::new();
+        if let Some(env_map) = env {
+            for (k, v) in env_map.iter() {
+                let key = any_to_key_string(k).map_err(to_py_runtime_error)?;
+                let val = py_any_to_string(&v).map_err(to_py_runtime_error)?;
+                env_pairs.push((key, val));
+            }
+        }
+
+        let req = RunRequest {
+            args,
+            shell,
+            capture_output,
+            stdout: stdout_spec,
+            stderr: stderr_spec,
+            input: input_bytes,
+            timeout,
+            cwd,
+            env: env_pairs,
+        };
+        let _ = check;
+        let out = with_live_bridge(|bridge| bridge.run_command(py, &req))?;
+        run_outcome_to_py_dict(py, out)
+    }
+
     const BASH_BRIDGE_BOOTSTRAP: &str = r#"
 class _BrushVarsMap:
     def __getitem__(self, name):
@@ -1145,6 +1590,50 @@ class _Brush:
     def __init__(self):
         self.vars = _BrushVarsMap()
         self.env = _BrushEnvMap()
+        self.PIPE = "PIPE"
+        self.STDOUT = "STDOUT"
+        self.DEVNULL = "DEVNULL"
+
+    def __call__(self, *args):
+        result = _brush_bridge.brush_call(list(args))
+        if result["returncode"] != 0:
+            err = RuntimeError("bash command failed")
+            err.returncode = result["returncode"]
+            err.cmd = list(args)
+            err.stdout = result["stdout"]
+            err.stderr = result["stderr"]
+            raise err
+        return result["stdout"].rstrip("\n")
+
+    def run(self, *args, capture_output=False, stdout=None, stderr=None, check=False, input=None, shell=False, timeout=None, cwd=None, env=None):
+        if capture_output:
+            stdout = self.PIPE
+            stderr = self.PIPE
+        result = _brush_bridge.brush_run(
+            list(args),
+            capture_output,
+            stdout,
+            stderr,
+            check,
+            input,
+            shell,
+            timeout,
+            cwd,
+            env,
+        )
+        completed = type("BashCompletedProcess", (), {})()
+        completed.args = result["args"]
+        completed.returncode = int(result["returncode"])
+        completed.stdout = result["stdout"]
+        completed.stderr = result["stderr"]
+        if check and completed.returncode != 0:
+            err = RuntimeError("bash command returned non-zero exit status")
+            err.returncode = completed.returncode
+            err.cmd = completed.args
+            err.stdout = completed.stdout
+            err.stderr = completed.stderr
+            raise err
+        return completed
 
 bash = _Brush()
 "#;

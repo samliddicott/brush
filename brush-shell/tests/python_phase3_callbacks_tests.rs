@@ -1,4 +1,4 @@
-//! Phase 2 integration tests for `bash.vars` / `bash.env` bridge behavior.
+//! Phase 3 integration tests for Python->bash callback APIs.
 
 #![cfg(all(unix, feature = "python-pyo3"))]
 #![cfg(test)]
@@ -58,49 +58,39 @@ fn run_script(script: &str) -> anyhow::Result<std::process::Output> {
 }
 
 #[test]
-fn bash_vars_scalar_array_assoc_mapping() -> anyhow::Result<()> {
-    let output = run_script(
-        "py \"bash.vars['a']='x'; bash.vars['arr']=[1,2]; bash.vars['cfg']={'k':'v'}\"; printf '%s|%s|%s|%s' \"$a\" \"${arr[0]}\" \"${arr[1]}\" \"${cfg[k]}\"",
-    )?;
-
+fn bash_callable_returns_stdout_string() -> anyhow::Result<()> {
+    let output = run_script("py \"print(bash('echo', 'hello'))\"")?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "x|1|2|v");
+    assert_eq!(String::from_utf8(output.stdout)?, "hello\n");
     Ok(())
 }
 
 #[test]
-fn bash_env_write_exports_and_delete_unsets() -> anyhow::Result<()> {
+fn bash_run_capture_output_completed_shape() -> anyhow::Result<()> {
     let output = run_script(
-        "py \"bash.env['P2E']='y'\"; export -p | grep -q 'declare -x P2E=\"y\"' && echo exported; py \"del bash.env['P2E']\"; test -z \"${P2E+x}\" && echo unset",
+        "py \"r = bash.run('echo', 'phase3', capture_output=True); print(r.returncode); print(r.stdout.strip()); print(r.stderr)\"",
     )?;
-
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "exported\nunset\n");
+    assert_eq!(String::from_utf8(output.stdout)?, "0\nphase3\n\n");
     Ok(())
 }
 
 #[test]
-fn bash_vars_attrs_and_declare_visible_shell_side() -> anyhow::Result<()> {
+fn bash_run_check_raises_on_nonzero() -> anyhow::Result<()> {
     let output = run_script(
-        "py \"bash.vars.declare('count', '7', integer=True, exported=True); bash.vars.set_attrs('count', trace=True)\"; declare -p count",
+        "py -x \"bash.run('false', check=True)\"; printf '%s|%s' \"$MCBASH_EXCEPTION\" \"$MCBASH_EXCEPTION_LANG\"",
     )?;
-
     assert_eq!(output.status.code(), Some(0));
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("declare -"));
-    assert!(stdout.contains(" i") || stdout.contains("-i"));
-    assert!(stdout.contains("x"));
-    assert!(stdout.contains("count=\"7\""));
+    assert_eq!(String::from_utf8(output.stdout)?, "RuntimeError|python");
     Ok(())
 }
 
 #[test]
-fn bash_vars_iteration_and_membership() -> anyhow::Result<()> {
+fn bash_run_shell_true_uses_command_string() -> anyhow::Result<()> {
     let output = run_script(
-        "v=$(py -r out -e \"('HOME' in bash.vars, len(list(bash.vars)) >= 1)\"; printf '%s' \"$out\"); printf '%s' \"$v\"",
+        "py \"r = bash.run('echo shell_mode', shell=True, capture_output=True); print(r.stdout.strip())\"",
     )?;
-
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "(True, True)");
+    assert_eq!(String::from_utf8(output.stdout)?, "shell_mode\n");
     Ok(())
 }
