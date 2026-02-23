@@ -123,3 +123,23 @@ echo "$ok""#,
     assert_eq!(String::from_utf8(output.stdout)?, "1\n");
     Ok(())
 }
+
+#[test]
+fn python_bash_shared_roundtrip_scalar() -> anyhow::Result<()> {
+    let output = run_script(
+        "py \"bash.shared['sx']='1'\"; (sx=9); py -r out -e \"int(bash.shared['sx'])\"; printf '%s|%s' \"$sx\" \"$out\"",
+    )?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?, "9|9");
+    Ok(())
+}
+
+#[test]
+fn python_bash_shared_sets_array_assoc_integer() -> anyhow::Result<()> {
+    let output = run_script(
+        "py \"bash.shared['arr']=[1,2]; bash.shared['cfg']={'k':'v'}; bash.shared['n']=5\"; (n+=1); printf '%s|%s|%s' \"${arr[1]}\" \"${cfg[k]}\" \"$n\"",
+    )?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?, "2|v|6");
+    Ok(())
+}

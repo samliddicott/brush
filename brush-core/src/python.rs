@@ -45,6 +45,11 @@ mod imp {
         fn env_del(&mut self, name: &str) -> PyResult<()>;
         fn env_contains(&mut self, name: &str) -> PyResult<bool>;
         fn env_keys(&mut self) -> PyResult<Vec<String>>;
+        fn shared_get(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject>;
+        fn shared_set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()>;
+        fn shared_del(&mut self, name: &str) -> PyResult<()>;
+        fn shared_contains(&mut self, name: &str) -> PyResult<bool>;
+        fn shared_keys(&mut self) -> PyResult<Vec<String>>;
         fn funcs_get_body(&mut self, name: &str) -> PyResult<String>;
         fn funcs_contains(&mut self, name: &str) -> PyResult<bool>;
         fn funcs_keys(&mut self) -> PyResult<Vec<String>>;
@@ -261,6 +266,85 @@ mod imp {
                 .iter_exported()
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>())
+        }
+
+        fn shared_get(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+            if !self.shell().shared_is_bound(name) {
+                return Err(PyKeyError::new_err(name.to_string()));
+            }
+            let var = self
+                .shell()
+                .env_var_cloned(name)
+                .map_err(to_py_runtime_error)?
+                .ok_or_else(|| PyKeyError::new_err(name.to_string()))?;
+            shell_var_to_py(py, self.shell(), &var).map_err(to_py_runtime_error)
+        }
+
+        fn shared_set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+            let py_int_like = value.extract::<i64>().is_ok();
+            let shell_value = py_any_to_shell_value(value).map_err(to_py_runtime_error)?;
+
+            match shell_value {
+                ShellValue::String(s) => {
+                    let existing_int = self
+                        .shell()
+                        .env_var(name)
+                        .is_some_and(crate::variables::ShellVariable::is_treated_as_integer);
+                    if py_int_like || (existing_int && self.shell().shared_is_bound(name)) {
+                        self.shell_mut()
+                            .shared_bind_integer(name, Some(s.as_str()))
+                            .map_err(to_py_runtime_error)
+                    } else {
+                        self.shell_mut()
+                            .shared_bind_scalar(name, Some(s.as_str()))
+                            .map_err(to_py_runtime_error)
+                    }
+                }
+                ShellValue::IndexedArray(values) => {
+                    self.shell_mut()
+                        .env_mut()
+                        .set_global(name, ShellVariable::new(ShellValue::IndexedArray(values)))
+                        .map_err(to_py_runtime_error)?;
+                    self.shell_mut()
+                        .shared_bind_indexed_array(name)
+                        .map_err(to_py_runtime_error)
+                }
+                ShellValue::AssociativeArray(values) => {
+                    self.shell_mut()
+                        .env_mut()
+                        .set_global(
+                            name,
+                            ShellVariable::new(ShellValue::AssociativeArray(values)),
+                        )
+                        .map_err(to_py_runtime_error)?;
+                    self.shell_mut()
+                        .shared_bind_assoc_array(name)
+                        .map_err(to_py_runtime_error)
+                }
+                ShellValue::Unset(_) | ShellValue::Dynamic { .. } => {
+                    Err(PyRuntimeError::new_err("unsupported value for bash.shared"))
+                }
+            }
+        }
+
+        fn shared_del(&mut self, name: &str) -> PyResult<()> {
+            let deleted = self
+                .shell_mut()
+                .shared_delete(name)
+                .map_err(to_py_runtime_error)?;
+            if deleted {
+                Ok(())
+            } else {
+                Err(PyKeyError::new_err(name.to_string()))
+            }
+        }
+
+        fn shared_contains(&mut self, name: &str) -> PyResult<bool> {
+            Ok(self.shell().shared_is_bound(name))
+        }
+
+        fn shared_keys(&mut self) -> PyResult<Vec<String>> {
+            Ok(self.shell().shared_bound_names())
         }
 
         fn funcs_get_body(&mut self, name: &str) -> PyResult<String> {
@@ -1206,6 +1290,36 @@ mod imp {
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
             .add_function(
+                pyo3::wrap_pyfunction!(brush_shared_get, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_shared_set, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_shared_del, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_shared_contains, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_shared_keys, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
                 pyo3::wrap_pyfunction!(brush_funcs_get_body, &bridge_module)
                     .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
             )
@@ -1652,6 +1766,31 @@ mod imp {
     }
 
     #[pyfunction]
+    fn brush_shared_get(py: Python<'_>, name: String) -> PyResult<PyObject> {
+        with_live_bridge(|bridge| bridge.shared_get(py, name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_shared_set(name: String, value: Bound<'_, PyAny>) -> PyResult<()> {
+        with_live_bridge(|bridge| bridge.shared_set(name.as_str(), &value))
+    }
+
+    #[pyfunction]
+    fn brush_shared_del(name: String) -> PyResult<()> {
+        with_live_bridge(|bridge| bridge.shared_del(name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_shared_contains(name: String) -> PyResult<bool> {
+        with_live_bridge(|bridge| bridge.shared_contains(name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_shared_keys() -> PyResult<Vec<String>> {
+        with_live_bridge(|bridge| bridge.shared_keys())
+    }
+
+    #[pyfunction]
     fn brush_funcs_get_body(name: String) -> PyResult<String> {
         with_live_bridge(|bridge| bridge.funcs_get_body(name.as_str()))
     }
@@ -1834,6 +1973,25 @@ class _BrushEnvMap:
     def __len__(self):
         return len(_brush_bridge.brush_env_keys())
 
+class _BrushSharedMap:
+    def __getitem__(self, name):
+        return _brush_bridge.brush_shared_get(name)
+
+    def __setitem__(self, name, value):
+        _brush_bridge.brush_shared_set(name, value)
+
+    def __delitem__(self, name):
+        _brush_bridge.brush_shared_del(name)
+
+    def __contains__(self, name):
+        return _brush_bridge.brush_shared_contains(name)
+
+    def __iter__(self):
+        return iter(_brush_bridge.brush_shared_keys())
+
+    def __len__(self):
+        return len(_brush_bridge.brush_shared_keys())
+
 def _brush_raise_bash_error(args, result):
     err = RuntimeError("bash command failed")
     err.returncode = result["returncode"]
@@ -1900,6 +2058,7 @@ class _Brush:
     def __init__(self):
         self.vars = _BrushVarsMap()
         self.env = _BrushEnvMap()
+        self.shared = _BrushSharedMap()
         self.fn = _BrushFnMap()
         self.PIPE = "PIPE"
         self.STDOUT = "STDOUT"

@@ -34,6 +34,10 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         self.shared.bound_names.contains(name)
     }
 
+    pub(crate) fn shared_bound_names(&self) -> Vec<String> {
+        self.shared.bound_names.iter().cloned().collect()
+    }
+
     /// Binds a scalar shell variable to shared storage, optionally setting an initial value.
     pub fn shared_bind_scalar(
         &mut self,
