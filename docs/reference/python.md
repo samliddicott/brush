@@ -12,6 +12,28 @@ Build with Python support:
 cargo build -p brush-shell --features python-pyo3
 ```
 
+## Implementation parity matrix
+
+Status key:
+
+- `implemented`: available now
+- `partial`: available with limits noted below
+- `planned`: not implemented yet
+
+| Area | Status | Notes |
+|---|---|---|
+| `py` command (`-e`, `-x`, `-v`, `-r`) | implemented | Core execution and capture modes are available. |
+| `PYTHON ... END_PYTHON` block | implemented | Dedent defaults on; same-line options and redirection/pipeline placement supported. |
+| `bash.vars` / `bash.env` mappings | implemented | Live reads/writes into shell variable store. |
+| Variable attrs (`attrs`, `set_attrs`, `declare`) | implemented | Mirrors shell attribute model exposed by bridge. |
+| Ties (`py -t/-u`, `bash.tie/untie`) | implemented | Two-way variable tie hooks available. |
+| `bash.fn` map/call namespace | implemented | Function map operations and callable wrapper assignment are available. |
+| `bash()` convenience callback | implemented | Raises on non-zero shell status. |
+| `bash.run(...)` | partial | `timeout` not implemented. |
+| `bash.popen(...)` | partial | Pipe-heavy/streaming parity still incomplete; see caveats below. |
+| `shared` builtin + `bash.shared` | implemented | Shared typed variables and Python mapping are available. |
+| `bash.stack` | implemented | Read-only stack frame inspection. |
+
 ## Commands
 
 ### `py`
@@ -168,6 +190,11 @@ Function map and callable namespace.
 Runs a shell command and returns stdout (trailing newline stripped) on success.
 Raises on non-zero.
 
+Error contract:
+
+- non-zero command status raises `BashCalledProcessError`
+- attributes: `.returncode`, `.cmd`, `.stdout`, `.stderr`
+
 ### `bash.run(...)`
 
 Subprocess-style call returning a completed object with:
@@ -191,6 +218,12 @@ Current limitation:
 
 - `timeout` is not implemented yet.
 
+Error contract:
+
+- `check=False` (default): always returns a completed object
+- `check=True`: non-zero command status raises `BashCalledProcessError`
+- unsupported options (including current `timeout`) raise a Python exception from argument validation/runtime checks
+
 ### `bash.popen(...)`
 
 Long-running process handle with:
@@ -202,6 +235,11 @@ Long-running process handle with:
 - `.wait()`
 - `.communicate(input=None)`
 - context-manager support
+
+Current caveats:
+
+- designed for subprocess-style execution semantics first; full parity with Python `subprocess.Popen` stream behavior is still in progress
+- very large streaming workloads should be validated carefully in your workload before relying on strict CPython parity
 
 ### `bash.tie(...)` and `bash.untie(...)`
 
@@ -249,6 +287,13 @@ The shell `shared` builtin exposes shared backing directly from shell scripts:
 - delete: `shared -d name`
 
 `bash.shared` accesses the same shared backend from Python.
+
+Concurrency notes:
+
+- shared storage is process-visible across shell forks/subshells
+- updates are serialized through shared-backend locking
+- visibility is immediate after writer completion
+- there is no multi-key transaction API; treat each assignment as an independent update
 
 ## Exit and return code semantics
 

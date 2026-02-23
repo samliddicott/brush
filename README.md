@@ -173,6 +173,7 @@ This project started out of curiosity and a desire to learn—we're keeping that
 * [Building from source](docs/how-to/build.md) — development workflow
 * [Contribution guidelines](CONTRIBUTING.md) — how to submit changes
 * [Technical docs](docs/README.md) — architecture and reference
+* [Python reference](docs/reference/python.md) and [Python how-to](docs/how-to/use-python-in-brush.md) — embedded Python bridge
 
 ## Related Projects
 

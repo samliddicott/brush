@@ -7,6 +7,12 @@ The docs are grouped into:
 * [Reference material](reference/README.md)
 * [Explanation](explanation/README.md)
 
+Python entry points:
+
+* [Reference: Python bridge](reference/python.md)
+* [How-to: Use Python in brush](how-to/use-python-in-brush.md)
+* [Tutorial: Python bridge quickstart](tutorials/python-bridge-quickstart.md)
+
 If you're just getting started building this project, you should consult the [How to Build](how-to/build.md) guide.
 
 ---
