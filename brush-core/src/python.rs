@@ -6,9 +6,6 @@ mod imp {
     use std::collections::BTreeMap;
     use std::collections::HashSet;
     use std::io::Write;
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration;
 
     use pyo3::exceptions::{PyKeyError, PyRuntimeError};
     use pyo3::prelude::*;
@@ -63,10 +60,6 @@ mod imp {
         args: Vec<String>,
         shell: bool,
         capture_output: bool,
-        stdout: StdioSpec,
-        stderr: StdioSpec,
-        input: Option<Vec<u8>>,
-        timeout: Option<f64>,
         cwd: Option<String>,
         env: Vec<(String, String)>,
     }
@@ -238,17 +231,9 @@ mod imp {
 
         fn run_command(&mut self, _py: Python<'_>, req: &RunRequest) -> PyResult<RunOutcome> {
             let command = build_command_string(req);
-            let needs_child = req.shell
-                || req.capture_output
-                || req.stdout == StdioSpec::Pipe
-                || req.stdout == StdioSpec::DevNull
-                || req.stderr == StdioSpec::Pipe
-                || req.stderr == StdioSpec::Stdout
-                || req.stderr == StdioSpec::DevNull
-                || req.input.is_some()
-                || req.timeout.is_some();
-
-            if needs_child {
+            if req.capture_output {
+                self.run_capture_for_call(req, command.as_str())
+            } else if req.shell || req.cwd.is_some() || !req.env.is_empty() {
                 self.run_in_child(req, command.as_str())
             } else {
                 self.run_in_current(req, command.as_str())
@@ -258,42 +243,7 @@ mod imp {
 
     impl<SE: extensions::ShellExtensions> ShellLiveBridge<SE> {
         fn run_in_current(&mut self, req: &RunRequest, command: &str) -> PyResult<RunOutcome> {
-            let mut params = self.shell().default_exec_params();
-            let mut stdout_reader = None::<std::io::PipeReader>;
-            let mut stderr_reader = None::<std::io::PipeReader>;
-
-            if req.capture_output || req.stdout == StdioSpec::Pipe {
-                let (r, w) = std::io::pipe().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                params.set_fd(crate::openfiles::OpenFiles::STDOUT_FD, w.into());
-                stdout_reader = Some(r);
-            } else if req.stdout == StdioSpec::DevNull {
-                params.set_fd(
-                    crate::openfiles::OpenFiles::STDOUT_FD,
-                    crate::openfiles::null().map_err(to_py_runtime_error)?,
-                );
-            }
-
-            if req.capture_output || req.stderr == StdioSpec::Pipe {
-                let (r, w) = std::io::pipe().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, w.into());
-                stderr_reader = Some(r);
-            } else if req.stderr == StdioSpec::Stdout {
-                if let Some(stdout_file) = params
-                    .try_fd(self.shell(), crate::openfiles::OpenFiles::STDOUT_FD)
-                    .and_then(|f| f.try_clone().ok())
-                {
-                    params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, stdout_file);
-                }
-            } else if req.stderr == StdioSpec::DevNull {
-                params.set_fd(
-                    crate::openfiles::OpenFiles::STDERR_FD,
-                    crate::openfiles::null().map_err(to_py_runtime_error)?,
-                );
-            }
-
-            let stdout_join = spawn_reader(stdout_reader);
-            let stderr_join = spawn_reader(stderr_reader);
-
+            let params = self.shell().default_exec_params();
             let source = crate::SourceInfo::from("python-bridge");
             let result = tokio::task::block_in_place(|| {
                 let rt = tokio::runtime::Handle::current();
@@ -305,13 +255,11 @@ mod imp {
             .map_err(to_py_runtime_error)?;
 
             drop(params);
-            let stdout = join_reader(stdout_join)?;
-            let stderr = join_reader(stderr_join)?;
 
             Ok(RunOutcome {
                 returncode: result.exit_code.into(),
-                stdout,
-                stderr,
+                stdout: String::new(),
+                stderr: String::new(),
                 args: req.args.clone(),
             })
         }
@@ -320,123 +268,39 @@ mod imp {
             let mut subshell = self.shell().clone();
             let mut params = subshell.default_exec_params();
             params.process_group_policy = crate::ProcessGroupPolicy::SameProcessGroup;
-
-            let mut stdout_reader = None::<std::io::PipeReader>;
-            let mut stderr_reader = None::<std::io::PipeReader>;
-
-            if req.capture_output || req.stdout == StdioSpec::Pipe {
-                let (r, w) = std::io::pipe().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                params.set_fd(crate::openfiles::OpenFiles::STDOUT_FD, w.into());
-                stdout_reader = Some(r);
-            } else if req.stdout == StdioSpec::DevNull {
-                params.set_fd(
-                    crate::openfiles::OpenFiles::STDOUT_FD,
-                    crate::openfiles::null().map_err(to_py_runtime_error)?,
-                );
-            }
-
-            if req.capture_output || req.stderr == StdioSpec::Pipe {
-                let (r, w) = std::io::pipe().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, w.into());
-                stderr_reader = Some(r);
-            } else if req.stderr == StdioSpec::Stdout {
-                if let Some(stdout_file) = params
-                    .try_fd(&subshell, crate::openfiles::OpenFiles::STDOUT_FD)
-                    .and_then(|f| f.try_clone().ok())
-                {
-                    params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, stdout_file);
-                }
-            } else if req.stderr == StdioSpec::DevNull {
-                params.set_fd(
-                    crate::openfiles::OpenFiles::STDERR_FD,
-                    crate::openfiles::null().map_err(to_py_runtime_error)?,
-                );
-            }
-
-            let mut stdin_writer = None::<std::io::PipeWriter>;
-            if req.input.is_some() {
-                let (r, w) = std::io::pipe().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                params.set_fd(crate::openfiles::OpenFiles::STDIN_FD, r.into());
-                stdin_writer = Some(w);
-            }
-
-            let stdout_join = spawn_reader(stdout_reader);
-            let stderr_join = spawn_reader(stderr_reader);
-            let input_join = if let (Some(mut w), Some(input)) = (stdin_writer, req.input.clone()) {
-                Some(thread::spawn(move || {
-                    let _ = w.write_all(&input);
-                    let _ = w.flush();
-                }))
-            } else {
-                None
-            };
-
-            let cancel = subshell.cancel().clone();
-            let command = command.to_string();
-            let (tx, rx) = mpsc::channel();
-            thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                let run_result = match rt {
-                    Ok(rt) => {
-                        let source = crate::SourceInfo::from("python-bridge-child");
-                        rt.block_on(subshell.run_string(command, &source, &params))
-                    }
-                    Err(e) => Err(error::ErrorKind::InternalError(e.to_string()).into()),
-                };
-                let _ = tx.send(run_result);
-            });
-
-            let result = if let Some(timeout) = req.timeout {
-                let wait = Duration::from_secs_f64(timeout.max(0.0));
-                match rx.recv_timeout(wait) {
-                    Ok(v) => v,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        cancel.cancel();
-                        return Err(PyRuntimeError::new_err("bash.run timeout expired"));
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(PyRuntimeError::new_err("child shell failed"));
-                    }
-                }
-            } else {
-                rx.recv()
-                    .map_err(|_| PyRuntimeError::new_err("child shell failed"))?
-            }
+            let source = crate::SourceInfo::from("python-bridge-child");
+            let result = tokio::task::block_in_place(|| {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(subshell.run_string(command.to_string(), &source, &params))
+            })
             .map_err(to_py_runtime_error)?;
-
-            if let Some(j) = input_join {
-                let _ = j.join();
-            }
-            let stdout = join_reader(stdout_join)?;
-            let stderr = join_reader(stderr_join)?;
 
             Ok(RunOutcome {
                 returncode: result.exit_code.into(),
-                stdout,
-                stderr,
+                stdout: String::new(),
+                stderr: String::new(),
                 args: req.args.clone(),
             })
         }
-    }
 
-    fn spawn_reader(reader: Option<std::io::PipeReader>) -> Option<thread::JoinHandle<String>> {
-        reader.map(|mut r| {
-            thread::spawn(move || {
-                let mut buf = Vec::<u8>::new();
-                let _ = std::io::Read::read_to_end(&mut r, &mut buf);
-                String::from_utf8_lossy(&buf).to_string()
+        fn run_capture_for_call(&mut self, req: &RunRequest, command: &str) -> PyResult<RunOutcome> {
+            let params = self.shell().default_exec_params();
+            let output = tokio::task::block_in_place(|| {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(crate::commands::invoke_command_in_subshell_and_get_output(
+                    self.shell_mut(),
+                    &params,
+                    command.to_string(),
+                ))
             })
-        })
-    }
+            .map_err(to_py_runtime_error)?;
 
-    fn join_reader(join: Option<thread::JoinHandle<String>>) -> PyResult<String> {
-        if let Some(j) = join {
-            j.join()
-                .map_err(|_| PyRuntimeError::new_err("reader thread failed"))
-        } else {
-            Ok(String::new())
+            Ok(RunOutcome {
+                returncode: self.shell().last_exit_status(),
+                stdout: output,
+                stderr: String::new(),
+                args: req.args.clone(),
+            })
         }
     }
 
@@ -1463,10 +1327,6 @@ mod imp {
             args,
             shell: false,
             capture_output: true,
-            stdout: StdioSpec::Pipe,
-            stderr: StdioSpec::Pipe,
-            input: None,
-            timeout: None,
             cwd: None,
             env: Vec::new(),
         };
@@ -1513,6 +1373,17 @@ mod imp {
             None
         };
 
+        if capture_output
+            || stdout_spec != StdioSpec::Inherit
+            || stderr_spec != StdioSpec::Inherit
+            || input_bytes.is_some()
+            || timeout.is_some()
+        {
+            return Err(PyRuntimeError::new_err(
+                "bash.run pipe/input/timeout features are deferred to phase 6 (bash.popen)",
+            ));
+        }
+
         let mut env_pairs = Vec::<(String, String)>::new();
         if let Some(env_map) = env {
             for (k, v) in env_map.iter() {
@@ -1526,10 +1397,6 @@ mod imp {
             args,
             shell,
             capture_output,
-            stdout: stdout_spec,
-            stderr: stderr_spec,
-            input: input_bytes,
-            timeout,
             cwd,
             env: env_pairs,
         };

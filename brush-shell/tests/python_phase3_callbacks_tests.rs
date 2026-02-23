@@ -66,12 +66,10 @@ fn bash_callable_returns_stdout_string() -> anyhow::Result<()> {
 }
 
 #[test]
-fn bash_run_capture_output_completed_shape() -> anyhow::Result<()> {
-    let output = run_script(
-        "py \"r = bash.run('echo', 'phase3', capture_output=True); print(r.returncode); print(r.stdout.strip()); print(r.stderr)\"",
-    )?;
+fn bash_run_returns_completed_shape_without_pipes() -> anyhow::Result<()> {
+    let output = run_script("py \"r = bash.run('true'); print(r.returncode); print(len(r.stdout)); print(len(r.stderr))\"")?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "0\nphase3\n\n");
+    assert_eq!(String::from_utf8(output.stdout)?, "0\n0\n0\n");
     Ok(())
 }
 
@@ -87,10 +85,20 @@ fn bash_run_check_raises_on_nonzero() -> anyhow::Result<()> {
 
 #[test]
 fn bash_run_shell_true_uses_command_string() -> anyhow::Result<()> {
-    let output = run_script(
-        "py \"r = bash.run('echo shell_mode', shell=True, capture_output=True); print(r.stdout.strip())\"",
-    )?;
+    let output = run_script("x=1; py \"bash.run('x=2', shell=True)\"; echo \"$x\"")?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "shell_mode\n");
+    assert_eq!(String::from_utf8(output.stdout)?, "1\n");
+    Ok(())
+}
+
+#[test]
+fn bash_run_capture_output_is_deferred_to_phase6() -> anyhow::Result<()> {
+    let output =
+        run_script("py -x \"bash.run('echo', 'phase3', capture_output=True)\"; echo \"$MCBASH_EXCEPTION_MSG\"")?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        "bash.run pipe/input/timeout features are deferred to phase 6 (bash.popen)\n"
+    );
     Ok(())
 }
