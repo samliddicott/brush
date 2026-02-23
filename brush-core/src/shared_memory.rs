@@ -670,6 +670,51 @@ mod imp {
 
             Ok(())
         }
+
+        #[test]
+        fn concurrent_writers_distinct_names() -> anyhow::Result<()> {
+            let mut region = SharedRegion::create(1024 * 1024)?;
+            let workers = 8u32;
+            let iterations = 200u32;
+
+            let mut children = Vec::new();
+            for worker in 0..workers {
+                match unsafe { nix::unistd::fork()? } {
+                    nix::unistd::ForkResult::Child => {
+                        for i in 0..iterations {
+                            let name = format!("k{worker}");
+                            if region
+                                .set_scalar(name.as_str(), i.to_string().as_str())
+                                .is_err()
+                            {
+                                std::process::exit(2);
+                            }
+                        }
+                        std::process::exit(0);
+                    }
+                    nix::unistd::ForkResult::Parent { child } => {
+                        children.push(child);
+                    }
+                }
+            }
+
+            for child in children {
+                let status = nix::sys::wait::waitpid(child, None)?;
+                if !matches!(status, nix::sys::wait::WaitStatus::Exited(_, 0)) {
+                    return Err(anyhow::anyhow!("child failed: {status:?}"));
+                }
+            }
+
+            for worker in 0..workers {
+                let name = format!("k{worker}");
+                assert_eq!(
+                    region.get_scalar(name.as_str())?.as_deref(),
+                    Some((iterations - 1).to_string().as_str())
+                );
+            }
+
+            Ok(())
+        }
     }
 }
 

@@ -108,3 +108,18 @@ fn shared_integer_preserves_integer_behavior() -> anyhow::Result<()> {
     assert_eq!(String::from_utf8(output.stdout)?, "42\n");
     Ok(())
 }
+
+#[test]
+fn shared_concurrent_background_writes_distinct_names() -> anyhow::Result<()> {
+    let output = run_script(
+        r#"for i in $(seq 1 20); do eval "shared v$i=0"; done
+for i in $(seq 1 20); do (eval "v$i=$i") & done
+wait
+ok=1
+for i in $(seq 1 20); do eval "test \"\$v$i\" = \"$i\"" || ok=0; done
+echo "$ok""#,
+    )?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?, "1\n");
+    Ok(())
+}
