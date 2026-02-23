@@ -433,6 +433,20 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             if let Some(path) = path {
                 self.execute_via_external(&path)
             } else {
+                if self.command_name.contains('.')
+                    && self.shell.python().implicit_dotted_dispatch
+                {
+                    let tokens = self.args.iter().map(ToString::to_string).collect::<Vec<_>>();
+                    if let Some(result) =
+                        crate::python::try_callable(&mut self.shell, &self.params, &tokens)?
+                    {
+                        if let Some(post_execute) = self.post_execute {
+                            let _ = post_execute(&mut self.shell);
+                        }
+                        return Ok(result.into());
+                    }
+                }
+
                 if let Some(post_execute) = self.post_execute {
                     let _ = post_execute(&mut self.shell);
                 }

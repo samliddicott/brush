@@ -74,6 +74,8 @@ mod printf;
 mod pushd;
 #[cfg(feature = "builtin.pwd")]
 mod pwd;
+#[cfg(feature = "builtin.py")]
+mod py;
 #[cfg(feature = "builtin.read")]
 mod read;
 #[cfg(feature = "builtin.return")]

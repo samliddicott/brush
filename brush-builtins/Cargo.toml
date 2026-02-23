@@ -52,6 +52,7 @@ default = [
     'builtin.printf',
     'builtin.pushd',
     'builtin.pwd',
+    'builtin.py',
     'builtin.read',
     'builtin.return',
     'builtin.set',
@@ -107,6 +108,7 @@ default = [
 'builtin.printf' = []
 'builtin.pushd' = []
 'builtin.pwd' = []
+'builtin.py' = []
 'builtin.read' = []
 'builtin.return' = []
 'builtin.set' = []

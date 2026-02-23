@@ -147,6 +147,14 @@ impl ExecutionParameters {
         self.open_files.set_fd(fd, file);
     }
 
+    /// Removes the given file descriptor from this execution context.
+    ///
+    /// This marks the descriptor as explicitly not present for the remainder of
+    /// the current execution scope.
+    pub fn remove_fd(&mut self, fd: ShellFd) {
+        self.open_files.remove_fd(fd);
+    }
+
     /// Iterates over all open file descriptors in this context.
     ///
     /// # Arguments
