@@ -3,10 +3,11 @@
 #[cfg(feature = "python-pyo3")]
 mod imp {
     use std::collections::BTreeMap;
+    use std::collections::HashSet;
     use std::io::Write;
 
     use pyo3::prelude::*;
-    use pyo3::types::{PyAny, PyBool, PyDict, PyModule, PyTuple};
+    use pyo3::types::{PyAny, PyBool, PyDict, PyList, PyModule, PyTuple};
 
     use crate::{
         ExecutionExitCode, ExecutionParameters, ExecutionResult, ShellValue, ShellVariable, error,
@@ -193,6 +194,7 @@ mod imp {
         let attempted = Python::with_gil(|py| -> Result<Option<PyExecOutcome>, error::Error> {
             let globals = shell.python_mut().ensure_globals(py);
             let globals = globals.bind(py);
+            sync_bridge_from_shell(shell, py, globals)?;
 
             let Some(callable) = resolve_callable(py, globals, first)? else {
                 return Ok(None);
@@ -232,6 +234,7 @@ mod imp {
             };
 
             let (stdout, run_result) = run_with_stdout_capture(py, run)?;
+            sync_shell_from_bridge(shell, globals)?;
 
             match run_result {
                 Ok(value) => Ok(Some(PyExecOutcome {
@@ -280,6 +283,7 @@ mod imp {
         let outcome = Python::with_gil(|py| -> Result<PyExecOutcome, error::Error> {
             let globals = shell.python_mut().ensure_globals(py);
             let globals = globals.bind(py);
+            sync_bridge_from_shell(shell, py, globals)?;
 
             let run = || -> Result<Option<String>, PyErr> {
                 if options.expression_mode {
@@ -296,6 +300,7 @@ mod imp {
             };
 
             let (stdout, run_result) = run_with_stdout_capture(py, run)?;
+            sync_shell_from_bridge(shell, globals)?;
 
             match run_result {
                 Ok(value) => Ok(PyExecOutcome {
@@ -446,6 +451,396 @@ mod imp {
             exception: None,
         }
     }
+
+    fn sync_bridge_from_shell<SE: extensions::ShellExtensions>(
+        shell: &crate::Shell<SE>,
+        py: Python<'_>,
+        globals: &Bound<'_, PyDict>,
+    ) -> Result<(), error::Error> {
+        let vars_data = PyDict::new(py);
+        let vars_attrs = PyDict::new(py);
+        for (name, var) in shell.env().iter() {
+            vars_data
+                .set_item(name, shell_var_to_py(py, shell, var)?)
+                .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+            vars_attrs
+                .set_item(name, attrs_for_var(py, var)?)
+                .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        }
+
+        let env_data = PyDict::new(py);
+        for (name, var) in shell.env().iter_exported() {
+            env_data
+                .set_item(name, shell_var_to_py(py, shell, var)?)
+                .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        }
+
+        globals
+            .set_item("__brush_vars_data__", vars_data)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        globals
+            .set_item("__brush_env_data__", env_data)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        globals
+            .set_item("__brush_vars_attrs__", vars_attrs)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+
+        install_bash_bridge(py, globals)?;
+        Ok(())
+    }
+
+    fn sync_shell_from_bridge<SE: extensions::ShellExtensions>(
+        shell: &mut crate::Shell<SE>,
+        globals: &Bound<'_, PyDict>,
+    ) -> Result<(), error::Error> {
+        let Some(vars_any) = globals
+            .get_item("__brush_vars_data__")
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
+        else {
+            return Ok(());
+        };
+        let vars_data = vars_any
+            .downcast::<PyDict>()
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+
+        let Some(attrs_any) = globals
+            .get_item("__brush_vars_attrs__")
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
+        else {
+            return Ok(());
+        };
+        let attrs_data = attrs_any
+            .downcast::<PyDict>()
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+
+        let existing_names = shell
+            .env()
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        for (key, value) in vars_data.iter() {
+            let name = any_to_key_string(key)?;
+            seen.insert(name.clone());
+            let mut var = ShellVariable::new(py_any_to_shell_value(&value)?);
+            let attrs = attrs_for_name(attrs_data, name.as_str())?;
+            apply_attrs(&mut var, &attrs)?;
+            shell.env_mut().set_global(name, var)?;
+        }
+
+        for name in existing_names {
+            if !seen.contains(name.as_str()) {
+                let _ = shell.env_mut().unset(name.as_str())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn install_bash_bridge(
+        py: Python<'_>,
+        globals: &Bound<'_, PyDict>,
+    ) -> Result<(), error::Error> {
+        let builtins = PyModule::import(py, "builtins")
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        let exec_fn = builtins
+            .getattr("exec")
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        exec_fn
+            .call1((BASH_BRIDGE_BOOTSTRAP, globals, globals))
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn shell_var_to_py<'py, SE: extensions::ShellExtensions>(
+        py: Python<'py>,
+        shell: &crate::Shell<SE>,
+        var: &ShellVariable,
+    ) -> Result<PyObject, error::Error> {
+        match var.resolve_value(shell) {
+            ShellValue::Unset(_) => Ok(py.None()),
+            ShellValue::String(s) => Ok(s
+                .into_pyobject(py)
+                .unwrap_or_else(|never| match never {})
+                .unbind()
+                .into()),
+            ShellValue::IndexedArray(values) => {
+                let mut ordered = values.into_iter().collect::<Vec<(u64, String)>>();
+                ordered.sort_by_key(|(k, _)| *k);
+                let list_values = ordered.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+                Ok(PyList::new(py, list_values)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
+                    .unbind()
+                    .into())
+            }
+            ShellValue::AssociativeArray(values) => {
+                let d = PyDict::new(py);
+                for (k, v) in values {
+                    d.set_item(k, v)
+                        .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+                }
+                Ok(d.unbind().into())
+            }
+            ShellValue::Dynamic { .. } => Ok(var
+                .value()
+                .to_cow_str(shell)
+                .to_string()
+                .into_pyobject(py)
+                .unwrap_or_else(|never| match never {})
+                .unbind()
+                .into()),
+        }
+    }
+
+    fn attrs_for_var(py: Python<'_>, var: &ShellVariable) -> Result<PyObject, error::Error> {
+        let mut attrs = Vec::<String>::new();
+        if var.is_exported() {
+            attrs.push("exported".to_string());
+        }
+        if var.is_readonly() {
+            attrs.push("readonly".to_string());
+        }
+        if var.is_trace_enabled() {
+            attrs.push("trace".to_string());
+        }
+        if var.is_treated_as_integer() {
+            attrs.push("integer".to_string());
+        }
+        if var.is_treated_as_nameref() {
+            attrs.push("nameref".to_string());
+        }
+        match var.get_update_transform() {
+            crate::variables::ShellVariableUpdateTransform::Lowercase => {
+                attrs.push("lowercase".to_string());
+            }
+            crate::variables::ShellVariableUpdateTransform::Uppercase => {
+                attrs.push("uppercase".to_string());
+            }
+            crate::variables::ShellVariableUpdateTransform::None
+            | crate::variables::ShellVariableUpdateTransform::Capitalize => {}
+        }
+
+        Ok(PyList::new(py, attrs)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
+            .unbind()
+            .into())
+    }
+
+    fn attrs_for_name(
+        attrs_data: &Bound<'_, PyDict>,
+        name: &str,
+    ) -> Result<HashSet<String>, error::Error> {
+        let Some(v) = attrs_data
+            .get_item(name)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
+        else {
+            return Ok(HashSet::new());
+        };
+
+        if let Ok(list) = v.downcast::<PyList>() {
+            let mut out = HashSet::new();
+            for item in list.iter() {
+                out.insert(any_to_key_string(item)?);
+            }
+            return Ok(out);
+        }
+
+        let mut out = HashSet::new();
+        let iter = v
+            .try_iter()
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        for item in iter {
+            let item = item.map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+            out.insert(any_to_key_string(item)?);
+        }
+        Ok(out)
+    }
+
+    fn apply_attrs(var: &mut ShellVariable, attrs: &HashSet<String>) -> Result<(), error::Error> {
+        if attrs.contains("exported") {
+            var.export();
+        } else {
+            var.unexport();
+        }
+
+        if attrs.contains("trace") {
+            var.enable_trace();
+        } else {
+            var.disable_trace();
+        }
+
+        if attrs.contains("integer") {
+            var.treat_as_integer();
+        } else {
+            var.unset_treat_as_integer();
+        }
+
+        if attrs.contains("nameref") {
+            var.treat_as_nameref();
+        } else {
+            var.unset_treat_as_nameref();
+        }
+
+        if attrs.contains("readonly") {
+            var.set_readonly();
+        }
+
+        if attrs.contains("uppercase") {
+            var.set_update_transform(crate::variables::ShellVariableUpdateTransform::Uppercase);
+        } else if attrs.contains("lowercase") {
+            var.set_update_transform(crate::variables::ShellVariableUpdateTransform::Lowercase);
+        } else {
+            var.set_update_transform(crate::variables::ShellVariableUpdateTransform::None);
+        }
+
+        Ok(())
+    }
+
+    fn py_any_to_shell_value(any: &Bound<'_, PyAny>) -> Result<ShellValue, error::Error> {
+        if let Ok(d) = any.downcast::<PyDict>() {
+            let mut map = BTreeMap::<String, String>::new();
+            for (k, v) in d.iter() {
+                map.insert(any_to_key_string(k)?, py_any_to_string(&v)?);
+            }
+            return Ok(ShellValue::AssociativeArray(map));
+        }
+
+        if let Ok(list) = any.downcast::<PyList>() {
+            let mut map = BTreeMap::<u64, String>::new();
+            for (idx, v) in list.iter().enumerate() {
+                map.insert(idx as u64, py_any_to_string(&v)?);
+            }
+            return Ok(ShellValue::IndexedArray(map));
+        }
+
+        if let Ok(tuple) = any.downcast::<PyTuple>() {
+            let mut map = BTreeMap::<u64, String>::new();
+            for (idx, v) in tuple.iter().enumerate() {
+                map.insert(idx as u64, py_any_to_string(&v)?);
+            }
+            return Ok(ShellValue::IndexedArray(map));
+        }
+
+        Ok(ShellValue::String(py_any_to_string(any)?))
+    }
+
+    fn py_any_to_string(any: &Bound<'_, PyAny>) -> Result<String, error::Error> {
+        if any.is_none() {
+            return Ok(String::new());
+        }
+        if let Ok(s) = any.extract::<String>() {
+            return Ok(s);
+        }
+        if let Ok(v) = any.extract::<bool>() {
+            return Ok(v.to_string());
+        }
+        if let Ok(v) = any.extract::<i64>() {
+            return Ok(v.to_string());
+        }
+        if let Ok(v) = any.extract::<f64>() {
+            return Ok(v.to_string());
+        }
+        any.str()
+            .map(|s| s.to_string())
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()).into())
+    }
+
+    fn any_to_key_string(any: Bound<'_, PyAny>) -> Result<String, error::Error> {
+        if let Ok(s) = any.extract::<String>() {
+            return Ok(s);
+        }
+        any.str()
+            .map(|s| s.to_string())
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()).into())
+    }
+
+    const BASH_BRIDGE_BOOTSTRAP: &str = r#"
+class _BrushVarsMap:
+    def __init__(self, data, attrs):
+        self._d = data
+        self._attrs = attrs
+
+    def __getitem__(self, name):
+        return self._d[name]
+
+    def __setitem__(self, name, value):
+        self._d[name] = value
+        if name not in self._attrs:
+            self._attrs[name] = set()
+
+    def __delitem__(self, name):
+        del self._d[name]
+        if name in self._attrs:
+            del self._attrs[name]
+
+    def __contains__(self, name):
+        return name in self._d
+
+    def __iter__(self):
+        return iter(self._d)
+
+    def __len__(self):
+        return len(self._d)
+
+    def attrs(self, name):
+        return set(self._attrs.get(name, set()))
+
+    def set_attrs(self, name, **kwargs):
+        s = set(self._attrs.get(name, set()))
+        for key, val in kwargs.items():
+            if val:
+                s.add(key)
+            else:
+                s.discard(key)
+        if "uppercase" in s and "lowercase" in s:
+            s.discard("lowercase")
+        self._attrs[name] = s
+        return set(s)
+
+    def declare(self, name, value="", **kwargs):
+        self[name] = value
+        return self.set_attrs(name, **kwargs)
+
+class _BrushEnvMap:
+    def __init__(self, env_data, vars_data, attrs):
+        self._env = env_data
+        self._vars = vars_data
+        self._attrs = attrs
+
+    def __getitem__(self, name):
+        return self._env[name]
+
+    def __setitem__(self, name, value):
+        self._env[name] = value
+        self._vars[name] = value
+        s = set(self._attrs.get(name, set()))
+        s.add("exported")
+        self._attrs[name] = s
+
+    def __delitem__(self, name):
+        if name in self._env:
+            del self._env[name]
+        if name in self._vars:
+            del self._vars[name]
+        if name in self._attrs:
+            del self._attrs[name]
+
+    def __contains__(self, name):
+        return name in self._env
+
+    def __iter__(self):
+        return iter(self._env)
+
+    def __len__(self):
+        return len(self._env)
+
+class _Brush:
+    def __init__(self, vars_data, env_data, attrs):
+        self.vars = _BrushVarsMap(vars_data, attrs)
+        self.env = _BrushEnvMap(env_data, vars_data, attrs)
+
+bash = _Brush(__brush_vars_data__, __brush_env_data__, __brush_vars_attrs__)
+"#;
 
     fn looks_callable(tokens: &[String]) -> bool {
         let Some(first) = tokens.first() else {
@@ -822,6 +1217,71 @@ mod tests {
         };
         assert!(!tb.is_empty());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bash_vars_round_trip_and_type_mapping() -> anyhow::Result<()> {
+        let mut shell = crate::Shell::builder().build().await?;
+        exec_code_with_options(
+            &mut shell,
+            "bash.vars['sc']='v'; bash.vars['arr']=[1,2,3]; bash.vars['assoc']={'k':'x'}",
+            PyExecOptions::default(),
+        )?;
+
+        assert_eq!(shell.env_str("sc").as_deref(), Some("v"));
+
+        let arr = shell.env_var("arr").expect("arr set");
+        let crate::ShellValue::IndexedArray(arr_values) = arr.value() else {
+            panic!("arr must be indexed");
+        };
+        assert_eq!(arr_values.get(&0).map(|s| s.as_str()), Some("1"));
+        assert_eq!(arr_values.get(&1).map(|s| s.as_str()), Some("2"));
+        assert_eq!(arr_values.get(&2).map(|s| s.as_str()), Some("3"));
+
+        let assoc = shell.env_var("assoc").expect("assoc set");
+        let crate::ShellValue::AssociativeArray(assoc_values) = assoc.value() else {
+            panic!("assoc must be associative");
+        };
+        assert_eq!(assoc_values.get("k").map(|s| s.as_str()), Some("x"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bash_env_write_marks_export_and_delete_unsets() -> anyhow::Result<()> {
+        let mut shell = crate::Shell::builder().build().await?;
+        exec_code_with_options(
+            &mut shell,
+            "bash.env['PH2_ENV']='yes'; del bash.env['PH2_ENV']",
+            PyExecOptions::default(),
+        )?;
+        assert!(shell.env_var("PH2_ENV").is_none());
+
+        exec_code_with_options(
+            &mut shell,
+            "bash.env['PH2_ENV']='yes'",
+            PyExecOptions::default(),
+        )?;
+        let env_var = shell.env_var("PH2_ENV").expect("env var set");
+        assert!(env_var.is_exported());
+        assert_eq!(shell.env_str("PH2_ENV").as_deref(), Some("yes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bash_vars_attrs_and_declare_apply_flags() -> anyhow::Result<()> {
+        let mut shell = crate::Shell::builder().build().await?;
+        exec_code_with_options(
+            &mut shell,
+            "bash.vars.declare('ct', '42', integer=True, exported=True); bash.vars.set_attrs('ct', trace=True)",
+            PyExecOptions::default(),
+        )?;
+
+        let ct = shell.env_var("ct").expect("ct set");
+        assert!(ct.is_exported());
+        assert!(ct.is_treated_as_integer());
+        assert!(ct.is_trace_enabled());
+        assert_eq!(shell.env_str("ct").as_deref(), Some("42"));
         Ok(())
     }
 }
