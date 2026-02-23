@@ -14,6 +14,19 @@ rust-version.workspace = true
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/{ name }-v{ version }/brush-{ target }{ archive-suffix }"
 
+[package.metadata.deb]
+maintainer = "brush maintainers"
+copyright = "2026, brush contributors"
+license-file = ["../LICENSE", "0"]
+extended-description-file = "../README.md"
+depends = "$auto"
+section = "shells"
+priority = "optional"
+assets = [
+    ["../README.md", "usr/share/doc/brush-shell/README.md", "644"],
+    ["../CHANGELOG.md", "usr/share/doc/brush-shell/changelog", "644"],
+]
+
 [lib]
 bench = false
 
