@@ -34,6 +34,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         self.shared.bound_names.contains(name)
     }
 
+    #[cfg_attr(not(feature = "python-pyo3"), allow(dead_code))]
     pub(crate) fn shared_bound_names(&self) -> Vec<String> {
         self.shared.bound_names.iter().cloned().collect()
     }
