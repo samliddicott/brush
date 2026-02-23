@@ -148,11 +148,9 @@ impl Evaluatable for ast::ArithmeticExpr {
 }
 
 fn get_var_value<'a>(
-    shell: &'a mut Shell<impl extensions::ShellExtensions>,
+    shell: &'a Shell<impl extensions::ShellExtensions>,
     name: &str,
 ) -> Result<Cow<'a, str>, EvalError> {
-    crate::python::sync_tied_var_from_python(shell, name)
-        .map_err(|_err| EvalError::FailedToExpandExpression(name.to_string()))?;
     let value = shell.env_var(name).map(|var| var.resolve_value(shell));
 
     if let Some(value) = value
@@ -175,8 +173,6 @@ fn deref_lvalue(
     let value_str: Cow<'_, str> = match lvalue {
         ast::ArithmeticTarget::Variable(name) => get_var_value(shell, name.as_str())?,
         ast::ArithmeticTarget::ArrayElement(name, index_expr) => {
-            crate::python::sync_tied_var_from_python(shell, name.as_str())
-                .map_err(|_err| EvalError::FailedToExpandExpression(name.clone()))?;
             let index_str = index_expr.eval(shell)?.to_string();
 
             shell
@@ -340,8 +336,6 @@ fn assign(
                     env::EnvironmentScope::Global,
                 )
                 .map_err(|_err| EvalError::FailedToUpdateEnvironment)?;
-            crate::python::push_tied_var_to_python(shell, name.as_str())
-                .map_err(|_err| EvalError::FailedToUpdateEnvironment)?;
         }
         ast::ArithmeticTarget::ArrayElement(name, index_expr) => {
             let index_str = index_expr.eval(shell)?.to_string();
@@ -356,8 +350,6 @@ fn assign(
                     env::EnvironmentLookup::Anywhere,
                     env::EnvironmentScope::Global,
                 )
-                .map_err(|_err| EvalError::FailedToUpdateEnvironment)?;
-            crate::python::push_tied_var_to_python(shell, name.as_str())
                 .map_err(|_err| EvalError::FailedToUpdateEnvironment)?;
         }
     }

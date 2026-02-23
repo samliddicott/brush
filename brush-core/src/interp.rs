@@ -1495,8 +1495,6 @@ async fn apply_assignment(
                 existing_value.export();
             }
 
-            let _ = crate::python::push_tied_var_to_python(shell, variable_name.as_str())?;
-
             // That's it!
             return Ok(());
         }
@@ -1528,9 +1526,7 @@ async fn apply_assignment(
         new_var.export();
     }
 
-    shell.env_mut().add(variable_name.as_str(), new_var, creation_scope)?;
-    let _ = crate::python::push_tied_var_to_python(shell, variable_name.as_str())?;
-    Ok(())
+    shell.env_mut().add(variable_name, new_var, creation_scope)
 }
 
 #[expect(clippy::too_many_lines)]

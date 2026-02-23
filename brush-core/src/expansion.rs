@@ -1515,7 +1515,6 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 variable_name,
                 concatenate,
             } => {
-                let _ = crate::python::sync_tied_var_from_python(self.shell, &variable_name)?;
                 let keys = if let Some((_, var)) = self.shell.env().get(variable_name) {
                     var.value().element_keys(self.shell)
                 } else {
@@ -1576,9 +1575,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 |_| Ok(()),
                 env::EnvironmentLookup::Anywhere,
                 env::EnvironmentScope::Global,
-            )?;
-            let _ = crate::python::push_tied_var_to_python(self.shell, variable_name)?;
-            Ok(())
+            )
         } else {
             self.shell.env_mut().update_or_add(
                 variable_name,
@@ -1586,9 +1583,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 |_| Ok(()),
                 env::EnvironmentLookup::Anywhere,
                 env::EnvironmentScope::Global,
-            )?;
-            let _ = crate::python::push_tied_var_to_python(self.shell, variable_name)?;
-            Ok(())
+            )
         }
     }
 
@@ -1624,10 +1619,6 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 concatenate: _concatenate,
             } => (Some(name.to_owned()), None),
         };
-
-        if let Some(name) = &name {
-            let _ = crate::python::sync_tied_var_from_python(self.shell, name);
-        }
 
         let var = name
             .as_ref()
@@ -1709,7 +1700,6 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             }
             brush_parser::word::Parameter::Special(s) => Ok(self.expand_special_parameter(s)),
             brush_parser::word::Parameter::Named(n) => {
-                let _ = crate::python::sync_tied_var_from_python(self.shell, n)?;
                 if !env::valid_variable_name(n.as_str()) {
                     Err(error::ErrorKind::BadSubstitution(n.clone()).into())
                 } else if let Some((_, var)) = self.shell.env().get(n) {
@@ -1728,7 +1718,6 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 }
             }
             brush_parser::word::Parameter::NamedWithIndex { name, index } => {
-                let _ = crate::python::sync_tied_var_from_python(self.shell, name)?;
                 // First check to see if it's an associative array.
                 let is_set_assoc_array = if let Some((_, var)) = self.shell.env().get(name) {
                     matches!(
@@ -1755,7 +1744,6 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 }
             }
             brush_parser::word::Parameter::NamedWithAllIndices { name, concatenate } => {
-                let _ = crate::python::sync_tied_var_from_python(self.shell, name)?;
                 if let Some((_, var)) = self.shell.env().get(name) {
                     let values = var.value().element_values(self.shell);
 

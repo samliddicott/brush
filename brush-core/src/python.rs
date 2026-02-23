@@ -105,7 +105,9 @@ mod imp {
 
     impl<SE: extensions::ShellExtensions> LiveBridge for ShellLiveBridge<SE> {
         fn vars_get(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
-            let _ = sync_tied_var_from_python(self.shell_mut(), name).map_err(to_py_runtime_error)?;
+            if let Some(obj) = get_tied_var_as_py(py, self.shell(), name).map_err(to_py_runtime_error)? {
+                return Ok(obj);
+            }
             let Some(var) = self.shell().env_var(name) else {
                 return Err(PyKeyError::new_err(name.to_string()));
             };
@@ -528,48 +530,6 @@ mod imp {
         Ok(coerced)
     }
 
-    /// Returns whether the given shell variable name currently has an active Python tie.
-    pub fn is_tied_var<SE: extensions::ShellExtensions>(
-        shell: &crate::Shell<SE>,
-        name: &str,
-    ) -> bool {
-        shell.python().tie(name).is_some()
-    }
-
-    /// Refreshes a tied shell variable by invoking its Python getter and syncing the value into
-    /// the shell environment. Returns `true` when a tie exists for the name.
-    pub fn sync_tied_var_from_python<SE: extensions::ShellExtensions>(
-        shell: &mut crate::Shell<SE>,
-        name: &str,
-    ) -> Result<bool, error::Error> {
-        let Some(binding) = cloned_tie_binding(shell, name) else {
-            return Ok(false);
-        };
-
-        Python::with_gil(|py| -> Result<(), error::Error> {
-            let globals = shell.python_mut().ensure_globals(py);
-            let globals = globals.bind(py);
-            install_bash_bridge(py, globals)?;
-
-            let call = || -> Result<Bound<'_, PyAny>, PyErr> {
-                let out = binding.getter.bind(py).call0()?;
-                coerce_tie_value(py, out, binding.tie_type)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            };
-
-            let py_obj = call().map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-
-            let mut var = ShellVariable::new(py_any_to_shell_value(&py_obj)?);
-            if let Some(existing) = shell.env_var(name) {
-                preserve_attrs_from_existing(existing, &mut var)?;
-            }
-            shell.env_mut().set_global(name, var)?;
-            Ok(())
-        })?;
-
-        Ok(true)
-    }
-
     fn set_tied_var_from_py<SE: extensions::ShellExtensions>(
         shell: &mut crate::Shell<SE>,
         name: &str,
@@ -600,45 +560,25 @@ mod imp {
             call().map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
             Ok(())
         })?;
-
-        let _ = sync_tied_var_from_python(shell, name)?;
         Ok(())
     }
 
-    /// Pushes the current shell variable value into a tied Python setter (if one exists), then
-    /// re-syncs from the Python getter. Returns `true` when a tie exists for the name.
-    pub fn push_tied_var_to_python<SE: extensions::ShellExtensions>(
-        shell: &mut crate::Shell<SE>,
+    fn get_tied_var_as_py<SE: extensions::ShellExtensions>(
+        py: Python<'_>,
+        shell: &crate::Shell<SE>,
         name: &str,
-    ) -> Result<bool, error::Error> {
+    ) -> Result<Option<PyObject>, error::Error> {
         let Some(binding) = cloned_tie_binding(shell, name) else {
-            return Ok(false);
-        };
-        let Some(setter) = binding.setter else {
-            return Ok(true);
-        };
-        let Some(var) = shell.env_var(name).cloned() else {
-            return Ok(true);
+            return Ok(None);
         };
 
-        Python::with_gil(|py| -> Result<(), error::Error> {
-            let globals = shell.python_mut().ensure_globals(py);
-            let globals = globals.bind(py);
-            install_bash_bridge(py, globals)?;
-            let py_value = shell_var_to_py(py, shell, &var)?;
-
-            let call = || -> Result<(), PyErr> {
-                let in_obj = coerce_tie_value(py, py_value.bind(py).to_owned().into_any(), binding.tie_type)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                setter.bind(py).call1((in_obj,))?;
-                Ok(())
-            };
-            call().map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-            Ok(())
-        })?;
-
-        let _ = sync_tied_var_from_python(shell, name)?;
-        Ok(true)
+        let out = binding
+            .getter
+            .bind(py)
+            .call0()
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        let coerced = coerce_tie_value(py, out, binding.tie_type)?;
+        Ok(Some(coerced.unbind().into()))
     }
 
     fn with_live_bridge<R>(f: impl FnOnce(&mut dyn LiveBridge) -> PyResult<R>) -> PyResult<R> {
@@ -2291,26 +2231,6 @@ mod imp {
         Ok(())
     }
 
-    pub fn is_tied_var<SE: extensions::ShellExtensions>(
-        _shell: &crate::Shell<SE>,
-        _name: &str,
-    ) -> bool {
-        false
-    }
-
-    pub fn sync_tied_var_from_python<SE: extensions::ShellExtensions>(
-        _shell: &mut crate::Shell<SE>,
-        _name: &str,
-    ) -> Result<bool, error::Error> {
-        Ok(false)
-    }
-
-    pub fn push_tied_var_to_python<SE: extensions::ShellExtensions>(
-        _shell: &mut crate::Shell<SE>,
-        _name: &str,
-    ) -> Result<bool, error::Error> {
-        Ok(false)
-    }
 }
 
 pub use imp::*;
