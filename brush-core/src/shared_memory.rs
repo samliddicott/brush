@@ -144,7 +144,7 @@ mod imp {
         }
 
         /// Reads the effective scalar value for `name`.
-        pub fn get_scalar(&self, name: &str) -> Result<Option<String>, error::Error> {
+        pub fn get_scalar(&mut self, name: &str) -> Result<Option<String>, error::Error> {
             self.with_read_lock(|region| {
                 let entries = region.scan_entries()?;
                 let mut current: Option<String> = None;
@@ -205,10 +205,11 @@ mod imp {
         }
 
         fn with_read_lock<T>(
-            &self,
+            &mut self,
             f: impl FnOnce(&Self) -> Result<T, error::Error>,
         ) -> Result<T, error::Error> {
             self.lock(libc::F_RDLCK as libc::c_short)?;
+            self.ensure_mapped_size_from_header()?;
             let out = f(self);
             let _ = self.unlock();
             out
@@ -219,6 +220,7 @@ mod imp {
             f: impl FnOnce(&mut Self) -> Result<T, error::Error>,
         ) -> Result<T, error::Error> {
             self.lock(libc::F_WRLCK as libc::c_short)?;
+            self.ensure_mapped_size_from_header()?;
             let out = f(self);
             let _ = self.unlock();
             out
@@ -282,7 +284,28 @@ mod imp {
             let used = usize::try_from(header.used_bytes)
                 .map_err(|_| error::ErrorKind::InternalError("used overflow".to_string()))?;
             if used + total_len > self.size {
-                return Err(error::ErrorKind::InternalError("shared region full".to_string()).into());
+                let mut new_size = self.size.max(4096);
+                while used + total_len > new_size {
+                    new_size = new_size.saturating_mul(2);
+                    if new_size < self.size {
+                        return Err(
+                            error::ErrorKind::InternalError("shared region size overflow".to_string())
+                                .into(),
+                        );
+                    }
+                }
+
+                let truncate_rc =
+                    unsafe { libc::ftruncate(self.fd.as_raw_fd(), new_size as libc::off_t) };
+                if truncate_rc != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                header.total_size = u32::try_from(new_size).map_err(|_| {
+                    error::ErrorKind::InternalError("shared region too large".to_string())
+                })?;
+                self.write_header(&header)?;
+                self.remap(new_size)?;
+                header = self.read_header()?;
             }
 
             let mut off = used;
@@ -310,6 +333,45 @@ mod imp {
             }
             header.generation = header.generation.saturating_add(1);
             self.write_header(&header)
+        }
+
+        fn ensure_mapped_size_from_header(&mut self) -> Result<(), error::Error> {
+            let header = self.read_header()?;
+            let declared = usize::try_from(header.total_size)
+                .map_err(|_| error::ErrorKind::InternalError("header size overflow".to_string()))?;
+            if declared > self.size {
+                self.remap(declared)?;
+            }
+            Ok(())
+        }
+
+        fn remap(&mut self, new_size: usize) -> Result<(), error::Error> {
+            if new_size == self.size {
+                return Ok(());
+            }
+            let old_ptr = self.ptr.as_ptr();
+            let old_size = self.size;
+
+            let mapped = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    new_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    self.fd.as_raw_fd(),
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let ptr = NonNull::new(mapped.cast::<u8>())
+                .ok_or_else(|| error::ErrorKind::InternalError("mmap returned null".to_string()))?;
+
+            let _ = unsafe { libc::munmap(old_ptr.cast(), old_size) };
+            self.ptr = ptr;
+            self.size = new_size;
+            Ok(())
         }
 
         fn scan_entries(&self) -> Result<Vec<DecodedEntry>, error::Error> {
