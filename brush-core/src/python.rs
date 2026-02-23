@@ -4,15 +4,226 @@
 mod imp {
     use std::collections::BTreeMap;
     use std::collections::HashSet;
+    use std::cell::RefCell;
     use std::io::Write;
 
     use pyo3::prelude::*;
+    use pyo3::exceptions::{PyKeyError, PyRuntimeError};
     use pyo3::types::{PyAny, PyBool, PyDict, PyList, PyModule, PyTuple};
 
     use crate::{
         ExecutionExitCode, ExecutionParameters, ExecutionResult, ShellValue, ShellVariable, error,
         extensions,
     };
+
+    thread_local! {
+        static ACTIVE_BRIDGE: RefCell<Option<*mut dyn LiveBridge>> = RefCell::new(None);
+    }
+
+    trait LiveBridge {
+        fn vars_get(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject>;
+        fn vars_set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()>;
+        fn vars_del(&mut self, name: &str) -> PyResult<()>;
+        fn vars_contains(&mut self, name: &str) -> PyResult<bool>;
+        fn vars_keys(&mut self) -> PyResult<Vec<String>>;
+        fn vars_attrs(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject>;
+        fn vars_set_attrs(
+            &mut self,
+            py: Python<'_>,
+            name: &str,
+            attrs: Option<&Bound<'_, PyDict>>,
+        ) -> PyResult<PyObject>;
+        fn vars_declare(
+            &mut self,
+            py: Python<'_>,
+            name: &str,
+            value: &Bound<'_, PyAny>,
+            attrs: Option<&Bound<'_, PyDict>>,
+        ) -> PyResult<PyObject>;
+        fn env_get(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject>;
+        fn env_set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()>;
+        fn env_del(&mut self, name: &str) -> PyResult<()>;
+        fn env_contains(&mut self, name: &str) -> PyResult<bool>;
+        fn env_keys(&mut self) -> PyResult<Vec<String>>;
+    }
+
+    struct ShellLiveBridge<SE: extensions::ShellExtensions> {
+        shell_ptr: *mut crate::Shell<SE>,
+    }
+
+    impl<SE: extensions::ShellExtensions> ShellLiveBridge<SE> {
+        fn shell(&self) -> &crate::Shell<SE> {
+            // SAFETY: shell_ptr is set from the currently executing shell and valid
+            // for the duration of with_active_bridge.
+            unsafe { &*self.shell_ptr }
+        }
+
+        fn shell_mut(&mut self) -> &mut crate::Shell<SE> {
+            // SAFETY: shell_ptr is set from the currently executing shell and valid
+            // for the duration of with_active_bridge, accessed on one thread.
+            unsafe { &mut *self.shell_ptr }
+        }
+    }
+
+    impl<SE: extensions::ShellExtensions> LiveBridge for ShellLiveBridge<SE> {
+        fn vars_get(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+            let Some(var) = self.shell().env_var(name) else {
+                return Err(PyKeyError::new_err(name.to_string()));
+            };
+            shell_var_to_py(py, self.shell(), var).map_err(to_py_runtime_error)
+        }
+
+        fn vars_set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+            let mut var = ShellVariable::new(py_any_to_shell_value(value).map_err(to_py_runtime_error)?);
+
+            if let Some(existing) = self.shell().env_var(name) {
+                preserve_attrs_from_existing(existing, &mut var).map_err(to_py_runtime_error)?;
+            }
+
+            self.shell_mut()
+                .env_mut()
+                .set_global(name, var)
+                .map_err(to_py_runtime_error)
+        }
+
+        fn vars_del(&mut self, name: &str) -> PyResult<()> {
+            let _ = self.shell_mut().env_mut().unset(name).map_err(to_py_runtime_error)?;
+            Ok(())
+        }
+
+        fn vars_contains(&mut self, name: &str) -> PyResult<bool> {
+            Ok(self.shell().env().is_set(name))
+        }
+
+        fn vars_keys(&mut self) -> PyResult<Vec<String>> {
+            Ok(self
+                .shell()
+                .env()
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>())
+        }
+
+        fn vars_attrs(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+            let Some(var) = self.shell().env_var(name) else {
+                return Err(PyKeyError::new_err(name.to_string()));
+            };
+            attrs_for_var(py, var).map_err(to_py_runtime_error)
+        }
+
+        fn vars_set_attrs(
+            &mut self,
+            py: Python<'_>,
+            name: &str,
+            attrs: Option<&Bound<'_, PyDict>>,
+        ) -> PyResult<PyObject> {
+            let Some(existing) = self.shell().env_var(name) else {
+                return Err(PyKeyError::new_err(name.to_string()));
+            };
+
+            let mut attrs_set = attrs_set_from_var(existing);
+            apply_kwargs_to_attrs(&mut attrs_set, attrs).map_err(to_py_runtime_error)?;
+
+            let mut var = existing.clone();
+            apply_attrs(&mut var, &attrs_set).map_err(to_py_runtime_error)?;
+            self.shell_mut()
+                .env_mut()
+                .set_global(name, var)
+                .map_err(to_py_runtime_error)?;
+
+            let attrs_vec = attrs_set.into_iter().collect::<Vec<_>>();
+            Ok(PyList::new(py, attrs_vec)?.unbind().into())
+        }
+
+        fn vars_declare(
+            &mut self,
+            py: Python<'_>,
+            name: &str,
+            value: &Bound<'_, PyAny>,
+            attrs: Option<&Bound<'_, PyDict>>,
+        ) -> PyResult<PyObject> {
+            let attrs_set = kwargs_to_attrs(attrs).map_err(to_py_runtime_error)?;
+            let mut var =
+                ShellVariable::new(py_any_to_shell_value(value).map_err(to_py_runtime_error)?);
+            apply_attrs(&mut var, &attrs_set).map_err(to_py_runtime_error)?;
+            self.shell_mut()
+                .env_mut()
+                .set_global(name, var)
+                .map_err(to_py_runtime_error)?;
+
+            let attrs_vec = attrs_set.into_iter().collect::<Vec<_>>();
+            Ok(PyList::new(py, attrs_vec)?.unbind().into())
+        }
+
+        fn env_get(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+            let Some(var) = self.shell().env_var(name) else {
+                return Err(PyKeyError::new_err(name.to_string()));
+            };
+            if !var.is_exported() {
+                return Err(PyKeyError::new_err(name.to_string()));
+            }
+            shell_var_to_py(py, self.shell(), var).map_err(to_py_runtime_error)
+        }
+
+        fn env_set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+            let mut var = ShellVariable::new(py_any_to_shell_value(value).map_err(to_py_runtime_error)?);
+            var.export();
+            self.shell_mut()
+                .env_mut()
+                .set_global(name, var)
+                .map_err(to_py_runtime_error)
+        }
+
+        fn env_del(&mut self, name: &str) -> PyResult<()> {
+            let _ = self.shell_mut().env_mut().unset(name).map_err(to_py_runtime_error)?;
+            Ok(())
+        }
+
+        fn env_contains(&mut self, name: &str) -> PyResult<bool> {
+            Ok(self
+                .shell()
+                .env_var(name)
+                .is_some_and(crate::variables::ShellVariable::is_exported))
+        }
+
+        fn env_keys(&mut self) -> PyResult<Vec<String>> {
+            Ok(self
+                .shell()
+                .env()
+                .iter_exported()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>())
+        }
+    }
+
+    fn to_py_runtime_error(err: error::Error) -> PyErr {
+        PyRuntimeError::new_err(err.to_string())
+    }
+
+    fn with_live_bridge<R>(f: impl FnOnce(&mut dyn LiveBridge) -> PyResult<R>) -> PyResult<R> {
+        ACTIVE_BRIDGE.with(|slot| {
+            let slot = slot.borrow_mut();
+            let Some(ptr) = *slot else {
+                return Err(PyRuntimeError::new_err("python bridge is not active"));
+            };
+
+            // SAFETY: pointer is set by with_active_bridge and valid during call.
+            let bridge = unsafe { &mut *ptr };
+            f(bridge)
+        })
+    }
+
+    fn with_active_bridge<R>(bridge: &mut dyn LiveBridge, f: impl FnOnce() -> R) -> R {
+        ACTIVE_BRIDGE.with(|slot| {
+            let bridge_ptr: *mut dyn LiveBridge = bridge;
+            // SAFETY: lifetime is constrained by this function, and pointer is restored before return.
+            let bridge_ptr_static: *mut dyn LiveBridge = unsafe { std::mem::transmute(bridge_ptr) };
+            let prev = slot.replace(Some(bridge_ptr_static));
+            let out = f();
+            let _ = slot.replace(prev);
+            out
+        })
+    }
 
     /// Python configuration and namespace state attached to a shell context.
     pub struct PythonContext {
@@ -192,9 +403,12 @@ mod imp {
         }
 
         let attempted = Python::with_gil(|py| -> Result<Option<PyExecOutcome>, error::Error> {
+            let mut bridge = ShellLiveBridge {
+                shell_ptr: shell as *mut _,
+            };
             let globals = shell.python_mut().ensure_globals(py);
             let globals = globals.bind(py);
-            sync_bridge_from_shell(shell, py, globals)?;
+            install_bash_bridge(py, globals)?;
 
             let Some(callable) = resolve_callable(py, globals, first)? else {
                 return Ok(None);
@@ -233,8 +447,9 @@ mod imp {
                 }
             };
 
-            let (stdout, run_result) = run_with_stdout_capture(py, run)?;
-            sync_shell_from_bridge(shell, globals)?;
+            let (stdout, run_result) = with_active_bridge(&mut bridge, || {
+                run_with_stdout_capture(py, run)
+            })?;
 
             match run_result {
                 Ok(value) => Ok(Some(PyExecOutcome {
@@ -281,9 +496,12 @@ mod imp {
         }
 
         let outcome = Python::with_gil(|py| -> Result<PyExecOutcome, error::Error> {
+            let mut bridge = ShellLiveBridge {
+                shell_ptr: shell as *mut _,
+            };
             let globals = shell.python_mut().ensure_globals(py);
             let globals = globals.bind(py);
-            sync_bridge_from_shell(shell, py, globals)?;
+            install_bash_bridge(py, globals)?;
 
             let run = || -> Result<Option<String>, PyErr> {
                 if options.expression_mode {
@@ -299,8 +517,9 @@ mod imp {
                 }
             };
 
-            let (stdout, run_result) = run_with_stdout_capture(py, run)?;
-            sync_shell_from_bridge(shell, globals)?;
+            let (stdout, run_result) = with_active_bridge(&mut bridge, || {
+                run_with_stdout_capture(py, run)
+            })?;
 
             match run_result {
                 Ok(value) => Ok(PyExecOutcome {
@@ -452,95 +671,84 @@ mod imp {
         }
     }
 
-    fn sync_bridge_from_shell<SE: extensions::ShellExtensions>(
-        shell: &crate::Shell<SE>,
-        py: Python<'_>,
-        globals: &Bound<'_, PyDict>,
-    ) -> Result<(), error::Error> {
-        let vars_data = PyDict::new(py);
-        let vars_attrs = PyDict::new(py);
-        for (name, var) in shell.env().iter() {
-            vars_data
-                .set_item(name, shell_var_to_py(py, shell, var)?)
-                .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-            vars_attrs
-                .set_item(name, attrs_for_var(py, var)?)
-                .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-        }
-
-        let env_data = PyDict::new(py);
-        for (name, var) in shell.env().iter_exported() {
-            env_data
-                .set_item(name, shell_var_to_py(py, shell, var)?)
-                .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-        }
-
-        globals
-            .set_item("__brush_vars_data__", vars_data)
-            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-        globals
-            .set_item("__brush_env_data__", env_data)
-            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-        globals
-            .set_item("__brush_vars_attrs__", vars_attrs)
-            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-
-        install_bash_bridge(py, globals)?;
-        Ok(())
-    }
-
-    fn sync_shell_from_bridge<SE: extensions::ShellExtensions>(
-        shell: &mut crate::Shell<SE>,
-        globals: &Bound<'_, PyDict>,
-    ) -> Result<(), error::Error> {
-        let Some(vars_any) = globals
-            .get_item("__brush_vars_data__")
-            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
-        else {
-            return Ok(());
-        };
-        let vars_data = vars_any
-            .downcast::<PyDict>()
-            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-
-        let Some(attrs_any) = globals
-            .get_item("__brush_vars_attrs__")
-            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
-        else {
-            return Ok(());
-        };
-        let attrs_data = attrs_any
-            .downcast::<PyDict>()
-            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-
-        let existing_names = shell
-            .env()
-            .iter()
-            .map(|(k, _)| k.clone())
-            .collect::<Vec<_>>();
-        let mut seen = HashSet::new();
-        for (key, value) in vars_data.iter() {
-            let name = any_to_key_string(key)?;
-            seen.insert(name.clone());
-            let mut var = ShellVariable::new(py_any_to_shell_value(&value)?);
-            let attrs = attrs_for_name(attrs_data, name.as_str())?;
-            apply_attrs(&mut var, &attrs)?;
-            shell.env_mut().set_global(name, var)?;
-        }
-
-        for name in existing_names {
-            if !seen.contains(name.as_str()) {
-                let _ = shell.env_mut().unset(name.as_str())?;
-            }
-        }
-
-        Ok(())
-    }
-
     fn install_bash_bridge(
         py: Python<'_>,
         globals: &Bound<'_, PyDict>,
     ) -> Result<(), error::Error> {
+        let bridge_module = PyModule::new(py, "_brush_bridge")
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_vars_get, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_vars_set, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_vars_del, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_vars_contains, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_vars_keys, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_vars_attrs, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_vars_set_attrs, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_vars_declare, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_env_get, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_env_set, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_env_del, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_env_contains, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(pyo3::wrap_pyfunction!(brush_env_keys, &bridge_module).map_err(
+                |e| error::ErrorKind::InternalError(e.to_string()),
+            )?)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+
+        globals
+            .set_item("_brush_bridge", bridge_module)
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+
         let builtins = PyModule::import(py, "builtins")
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         let exec_fn = builtins
@@ -624,36 +832,6 @@ mod imp {
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
             .unbind()
             .into())
-    }
-
-    fn attrs_for_name(
-        attrs_data: &Bound<'_, PyDict>,
-        name: &str,
-    ) -> Result<HashSet<String>, error::Error> {
-        let Some(v) = attrs_data
-            .get_item(name)
-            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?
-        else {
-            return Ok(HashSet::new());
-        };
-
-        if let Ok(list) = v.downcast::<PyList>() {
-            let mut out = HashSet::new();
-            for item in list.iter() {
-                out.insert(any_to_key_string(item)?);
-            }
-            return Ok(out);
-        }
-
-        let mut out = HashSet::new();
-        let iter = v
-            .try_iter()
-            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-        for item in iter {
-            let item = item.map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
-            out.insert(any_to_key_string(item)?);
-        }
-        Ok(out)
     }
 
     fn apply_attrs(var: &mut ShellVariable, attrs: &HashSet<String>) -> Result<(), error::Error> {
@@ -754,92 +932,221 @@ mod imp {
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()).into())
     }
 
+    fn kwargs_to_attrs(kwargs: Option<&Bound<'_, PyDict>>) -> Result<HashSet<String>, error::Error> {
+        let mut attrs_set = HashSet::new();
+        apply_kwargs_to_attrs(&mut attrs_set, kwargs)?;
+        Ok(attrs_set)
+    }
+
+    fn apply_kwargs_to_attrs(
+        attrs_set: &mut HashSet<String>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> Result<(), error::Error> {
+        let Some(kwargs) = kwargs else {
+            return Ok(());
+        };
+
+        for (k, v) in kwargs.iter() {
+            let key = any_to_key_string(k)?;
+            let val = v
+                .extract::<bool>()
+                .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+            if val {
+                attrs_set.insert(key);
+            } else {
+                attrs_set.remove(key.as_str());
+            }
+        }
+        if attrs_set.contains("uppercase") && attrs_set.contains("lowercase") {
+            attrs_set.remove("lowercase");
+        }
+
+        Ok(())
+    }
+
+    fn attrs_set_from_var(var: &ShellVariable) -> HashSet<String> {
+        let mut attrs_set = HashSet::new();
+        if var.is_exported() {
+            attrs_set.insert("exported".to_string());
+        }
+        if var.is_readonly() {
+            attrs_set.insert("readonly".to_string());
+        }
+        if var.is_trace_enabled() {
+            attrs_set.insert("trace".to_string());
+        }
+        if var.is_treated_as_integer() {
+            attrs_set.insert("integer".to_string());
+        }
+        if var.is_treated_as_nameref() {
+            attrs_set.insert("nameref".to_string());
+        }
+        match var.get_update_transform() {
+            crate::variables::ShellVariableUpdateTransform::Lowercase => {
+                attrs_set.insert("lowercase".to_string());
+            }
+            crate::variables::ShellVariableUpdateTransform::Uppercase => {
+                attrs_set.insert("uppercase".to_string());
+            }
+            crate::variables::ShellVariableUpdateTransform::None
+            | crate::variables::ShellVariableUpdateTransform::Capitalize => {}
+        }
+        attrs_set
+    }
+
+    fn preserve_attrs_from_existing(
+        existing: &ShellVariable,
+        var: &mut ShellVariable,
+    ) -> Result<(), error::Error> {
+        if existing.is_exported() {
+            var.export();
+        }
+        if existing.is_trace_enabled() {
+            var.enable_trace();
+        }
+        if existing.is_treated_as_integer() {
+            var.treat_as_integer();
+        }
+        if existing.is_treated_as_nameref() {
+            var.treat_as_nameref();
+        }
+        if existing.is_readonly() {
+            var.set_readonly();
+        }
+        var.set_update_transform(existing.get_update_transform());
+        Ok(())
+    }
+
+    #[pyfunction]
+    fn brush_vars_get(py: Python<'_>, name: String) -> PyResult<PyObject> {
+        with_live_bridge(|bridge| bridge.vars_get(py, name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_vars_set(name: String, value: Bound<'_, PyAny>) -> PyResult<()> {
+        with_live_bridge(|bridge| bridge.vars_set(name.as_str(), &value))
+    }
+
+    #[pyfunction]
+    fn brush_vars_del(name: String) -> PyResult<()> {
+        with_live_bridge(|bridge| bridge.vars_del(name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_vars_contains(name: String) -> PyResult<bool> {
+        with_live_bridge(|bridge| bridge.vars_contains(name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_vars_keys() -> PyResult<Vec<String>> {
+        with_live_bridge(|bridge| bridge.vars_keys())
+    }
+
+    #[pyfunction]
+    fn brush_vars_attrs(py: Python<'_>, name: String) -> PyResult<PyObject> {
+        with_live_bridge(|bridge| bridge.vars_attrs(py, name.as_str()))
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (name, attrs=None))]
+    fn brush_vars_set_attrs(
+        py: Python<'_>,
+        name: String,
+        attrs: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        with_live_bridge(|bridge| bridge.vars_set_attrs(py, name.as_str(), attrs.as_ref()))
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (name, value, attrs=None))]
+    fn brush_vars_declare(
+        py: Python<'_>,
+        name: String,
+        value: Bound<'_, PyAny>,
+        attrs: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        with_live_bridge(|bridge| bridge.vars_declare(py, name.as_str(), &value, attrs.as_ref()))
+    }
+
+    #[pyfunction]
+    fn brush_env_get(py: Python<'_>, name: String) -> PyResult<PyObject> {
+        with_live_bridge(|bridge| bridge.env_get(py, name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_env_set(name: String, value: Bound<'_, PyAny>) -> PyResult<()> {
+        with_live_bridge(|bridge| bridge.env_set(name.as_str(), &value))
+    }
+
+    #[pyfunction]
+    fn brush_env_del(name: String) -> PyResult<()> {
+        with_live_bridge(|bridge| bridge.env_del(name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_env_contains(name: String) -> PyResult<bool> {
+        with_live_bridge(|bridge| bridge.env_contains(name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_env_keys() -> PyResult<Vec<String>> {
+        with_live_bridge(|bridge| bridge.env_keys())
+    }
+
     const BASH_BRIDGE_BOOTSTRAP: &str = r#"
 class _BrushVarsMap:
-    def __init__(self, data, attrs):
-        self._d = data
-        self._attrs = attrs
-
     def __getitem__(self, name):
-        return self._d[name]
+        return _brush_bridge.brush_vars_get(name)
 
     def __setitem__(self, name, value):
-        self._d[name] = value
-        if name not in self._attrs:
-            self._attrs[name] = set()
+        _brush_bridge.brush_vars_set(name, value)
 
     def __delitem__(self, name):
-        del self._d[name]
-        if name in self._attrs:
-            del self._attrs[name]
+        _brush_bridge.brush_vars_del(name)
 
     def __contains__(self, name):
-        return name in self._d
+        return _brush_bridge.brush_vars_contains(name)
 
     def __iter__(self):
-        return iter(self._d)
+        return iter(_brush_bridge.brush_vars_keys())
 
     def __len__(self):
-        return len(self._d)
+        return len(_brush_bridge.brush_vars_keys())
 
     def attrs(self, name):
-        return set(self._attrs.get(name, set()))
+        return set(_brush_bridge.brush_vars_attrs(name))
 
     def set_attrs(self, name, **kwargs):
-        s = set(self._attrs.get(name, set()))
-        for key, val in kwargs.items():
-            if val:
-                s.add(key)
-            else:
-                s.discard(key)
-        if "uppercase" in s and "lowercase" in s:
-            s.discard("lowercase")
-        self._attrs[name] = s
-        return set(s)
+        return set(_brush_bridge.brush_vars_set_attrs(name, dict(kwargs)))
 
     def declare(self, name, value="", **kwargs):
-        self[name] = value
-        return self.set_attrs(name, **kwargs)
+        return set(_brush_bridge.brush_vars_declare(name, value, dict(kwargs)))
 
 class _BrushEnvMap:
-    def __init__(self, env_data, vars_data, attrs):
-        self._env = env_data
-        self._vars = vars_data
-        self._attrs = attrs
-
     def __getitem__(self, name):
-        return self._env[name]
+        return _brush_bridge.brush_env_get(name)
 
     def __setitem__(self, name, value):
-        self._env[name] = value
-        self._vars[name] = value
-        s = set(self._attrs.get(name, set()))
-        s.add("exported")
-        self._attrs[name] = s
+        _brush_bridge.brush_env_set(name, value)
 
     def __delitem__(self, name):
-        if name in self._env:
-            del self._env[name]
-        if name in self._vars:
-            del self._vars[name]
-        if name in self._attrs:
-            del self._attrs[name]
+        _brush_bridge.brush_env_del(name)
 
     def __contains__(self, name):
-        return name in self._env
+        return _brush_bridge.brush_env_contains(name)
 
     def __iter__(self):
-        return iter(self._env)
+        return iter(_brush_bridge.brush_env_keys())
 
     def __len__(self):
-        return len(self._env)
+        return len(_brush_bridge.brush_env_keys())
 
 class _Brush:
-    def __init__(self, vars_data, env_data, attrs):
-        self.vars = _BrushVarsMap(vars_data, attrs)
-        self.env = _BrushEnvMap(env_data, vars_data, attrs)
+    def __init__(self):
+        self.vars = _BrushVarsMap()
+        self.env = _BrushEnvMap()
 
-bash = _Brush(__brush_vars_data__, __brush_env_data__, __brush_vars_attrs__)
+bash = _Brush()
 "#;
 
     fn looks_callable(tokens: &[String]) -> bool {
