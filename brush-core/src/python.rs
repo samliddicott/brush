@@ -66,6 +66,14 @@ mod imp {
         ) -> PyResult<()>;
         fn tie_unset(&mut self, name: &str) -> PyResult<()>;
         fn run_command(&mut self, py: Python<'_>, req: &RunRequest) -> PyResult<RunOutcome>;
+        fn popen_start(&mut self, req: &RunRequest, spec: &PopenSpec) -> PyResult<PopenStart>;
+        fn popen_wait(&mut self, id: u64) -> PyResult<u8>;
+        fn popen_poll(&mut self, id: u64) -> PyResult<Option<u8>>;
+        fn popen_communicate(
+            &mut self,
+            id: u64,
+            input: Option<Vec<u8>>,
+        ) -> PyResult<(String, String, u8)>;
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,11 +92,33 @@ mod imp {
         env: Vec<(String, String)>,
     }
 
+    #[derive(Clone, Copy)]
+    struct PopenSpec {
+        stdin: StdioSpec,
+        stdout: StdioSpec,
+        stderr: StdioSpec,
+    }
+
     struct RunOutcome {
         returncode: u8,
         stdout: String,
         stderr: String,
         args: Vec<String>,
+    }
+
+    struct PopenStart {
+        id: u64,
+        args: Vec<String>,
+    }
+
+    struct PopenHandle {
+        join: tokio::task::JoinHandle<Result<ExecutionResult, error::Error>>,
+        stdin_writer: Option<std::io::PipeWriter>,
+        stdout_reader: Option<std::io::PipeReader>,
+        stderr_reader: Option<std::io::PipeReader>,
+        returncode: Option<u8>,
+        stdout_cache: Option<String>,
+        stderr_cache: Option<String>,
     }
 
     struct ShellLiveBridge<SE: extensions::ShellExtensions> {
@@ -442,6 +472,222 @@ mod imp {
                 self.run_in_current(req, command.as_str())
             }
         }
+
+        fn popen_start(&mut self, req: &RunRequest, spec: &PopenSpec) -> PyResult<PopenStart> {
+            let command = build_command_string(req);
+            let mut subshell = self.shell().clone();
+            let mut params = subshell.default_exec_params();
+            params.process_group_policy = crate::ProcessGroupPolicy::SameProcessGroup;
+
+            let mut stdin_writer: Option<std::io::PipeWriter> = None;
+            let mut stdout_reader: Option<std::io::PipeReader> = None;
+            let mut stderr_reader: Option<std::io::PipeReader> = None;
+
+            match spec.stdin {
+                StdioSpec::Inherit => {}
+                StdioSpec::DevNull => {
+                    let devnull = crate::openfiles::null().map_err(to_py_runtime_error)?;
+                    params.set_fd(crate::openfiles::OpenFiles::STDIN_FD, devnull);
+                }
+                StdioSpec::Pipe => {
+                    let (reader, writer) = std::io::pipe().map_err(to_py_io_error)?;
+                    params.set_fd(crate::openfiles::OpenFiles::STDIN_FD, reader.into());
+                    stdin_writer = Some(writer);
+                }
+                StdioSpec::Stdout => {
+                    return Err(PyRuntimeError::new_err("stdin cannot be STDOUT"));
+                }
+            }
+
+            let stdout_writer_for_stderr =
+                if spec.stdout == StdioSpec::Pipe && spec.stderr == StdioSpec::Stdout {
+                    let (reader, writer) = std::io::pipe().map_err(to_py_io_error)?;
+                    params.set_fd(
+                        crate::openfiles::OpenFiles::STDOUT_FD,
+                        writer.try_clone().map_err(to_py_io_error)?.into(),
+                    );
+                    stdout_reader = Some(reader);
+                    Some(writer)
+                } else {
+                    None
+                };
+
+            if stdout_writer_for_stderr.is_none() {
+                match spec.stdout {
+                    StdioSpec::Inherit => {}
+                    StdioSpec::DevNull => {
+                        let devnull = crate::openfiles::null().map_err(to_py_runtime_error)?;
+                        params.set_fd(crate::openfiles::OpenFiles::STDOUT_FD, devnull);
+                    }
+                    StdioSpec::Pipe => {
+                        let (reader, writer) = std::io::pipe().map_err(to_py_io_error)?;
+                        params.set_fd(crate::openfiles::OpenFiles::STDOUT_FD, writer.into());
+                        stdout_reader = Some(reader);
+                    }
+                    StdioSpec::Stdout => {}
+                }
+            }
+
+            match spec.stderr {
+                StdioSpec::Inherit => {}
+                StdioSpec::DevNull => {
+                    let devnull = crate::openfiles::null().map_err(to_py_runtime_error)?;
+                    params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, devnull);
+                }
+                StdioSpec::Pipe => {
+                    let (reader, writer) = std::io::pipe().map_err(to_py_io_error)?;
+                    params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, writer.into());
+                    stderr_reader = Some(reader);
+                }
+                StdioSpec::Stdout => {
+                    let Some(stdout_writer) = stdout_writer_for_stderr else {
+                        return Err(PyRuntimeError::new_err(
+                            "stderr=STDOUT requires stdout=PIPE for bash.popen",
+                        ));
+                    };
+                    params.set_fd(crate::openfiles::OpenFiles::STDERR_FD, stdout_writer.into());
+                }
+            }
+
+            let source = crate::SourceInfo::from("python-bridge-popen-child");
+            let join = tokio::spawn(async move {
+                subshell
+                    .run_string(command, &source, &params)
+                    .await
+                    .map(|result| {
+                        let _ = result; // keep same shape; return result directly
+                        result
+                    })
+            });
+
+            let id = self.shell_mut().python_mut().alloc_popen_id();
+            self.shell_mut().python_mut().insert_popen(
+                id,
+                PopenHandle {
+                    join,
+                    stdin_writer,
+                    stdout_reader,
+                    stderr_reader,
+                    returncode: None,
+                    stdout_cache: None,
+                    stderr_cache: None,
+                },
+            );
+
+            Ok(PopenStart {
+                id,
+                args: req.args.clone(),
+            })
+        }
+
+        fn popen_wait(&mut self, id: u64) -> PyResult<u8> {
+            let handle = self
+                .shell_mut()
+                .python_mut()
+                .popen_mut(id)
+                .ok_or_else(|| PyKeyError::new_err(format!("unknown popen id: {id}")))?;
+
+            if let Some(rc) = handle.returncode {
+                return Ok(rc);
+            }
+
+            let run_result = tokio::task::block_in_place(|| {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(&mut handle.join)
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let exec_result = run_result.map_err(to_py_runtime_error)?;
+            let rc: u8 = exec_result.exit_code.into();
+            handle.returncode = Some(rc);
+            Ok(rc)
+        }
+
+        fn popen_poll(&mut self, id: u64) -> PyResult<Option<u8>> {
+            let handle = self
+                .shell_mut()
+                .python_mut()
+                .popen_mut(id)
+                .ok_or_else(|| PyKeyError::new_err(format!("unknown popen id: {id}")))?;
+
+            if let Some(rc) = handle.returncode {
+                return Ok(Some(rc));
+            }
+
+            if handle.join.is_finished() {
+                let run_result = tokio::task::block_in_place(|| {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(&mut handle.join)
+                })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let exec_result = run_result.map_err(to_py_runtime_error)?;
+                let rc: u8 = exec_result.exit_code.into();
+                handle.returncode = Some(rc);
+                return Ok(Some(rc));
+            }
+
+            Ok(None)
+        }
+
+        fn popen_communicate(
+            &mut self,
+            id: u64,
+            input: Option<Vec<u8>>,
+        ) -> PyResult<(String, String, u8)> {
+            let handle = self
+                .shell_mut()
+                .python_mut()
+                .popen_mut(id)
+                .ok_or_else(|| PyKeyError::new_err(format!("unknown popen id: {id}")))?;
+
+            if let Some(stdout) = &handle.stdout_cache
+                && let Some(stderr) = &handle.stderr_cache
+                && let Some(rc) = handle.returncode
+            {
+                return Ok((stdout.clone(), stderr.clone(), rc));
+            }
+
+            let mut stdin_writer = handle.stdin_writer.take();
+            let stdout_reader = handle.stdout_reader.take();
+            let stderr_reader = handle.stderr_reader.take();
+
+            if let Some(mut writer) = stdin_writer.take()
+                && let Some(input) = input
+            {
+                use std::io::Write as _;
+                writer.write_all(&input).map_err(to_py_io_error)?;
+                writer.flush().map_err(to_py_io_error)?;
+            }
+
+            let stdout = if let Some(mut reader) = stdout_reader {
+                std::io::read_to_string(&mut reader).map_err(to_py_io_error)?
+            } else {
+                String::new()
+            };
+
+            let stderr = if let Some(mut reader) = stderr_reader {
+                std::io::read_to_string(&mut reader).map_err(to_py_io_error)?
+            } else {
+                String::new()
+            };
+
+            handle.stdout_cache = Some(stdout.clone());
+            handle.stderr_cache = Some(stderr.clone());
+            let rc = if let Some(rc) = handle.returncode {
+                rc
+            } else {
+                let run_result = tokio::task::block_in_place(|| {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(&mut handle.join)
+                })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let exec_result = run_result.map_err(to_py_runtime_error)?;
+                let rc: u8 = exec_result.exit_code.into();
+                handle.returncode = Some(rc);
+                rc
+            };
+
+            Ok((stdout, stderr, rc))
+        }
     }
 
     impl<SE: extensions::ShellExtensions> ShellLiveBridge<SE> {
@@ -566,6 +812,10 @@ mod imp {
     }
 
     fn to_py_runtime_error(err: error::Error) -> PyErr {
+        PyRuntimeError::new_err(err.to_string())
+    }
+
+    fn to_py_io_error(err: std::io::Error) -> PyErr {
         PyRuntimeError::new_err(err.to_string())
     }
 
@@ -734,6 +984,8 @@ mod imp {
     pub struct PythonContext {
         globals: Option<Py<PyDict>>,
         ties: BTreeMap<String, TieBinding>,
+        popens: BTreeMap<u64, PopenHandle>,
+        next_popen_id: u64,
         /// Enables command-not-found fallback for dotted names.
         pub implicit_dotted_dispatch: bool,
         /// Enables shell-argument auto-conversion for callable dispatch.
@@ -783,6 +1035,8 @@ mod imp {
             Self {
                 globals: None,
                 ties: BTreeMap::new(),
+                popens: BTreeMap::new(),
+                next_popen_id: 1,
                 implicit_dotted_dispatch: false,
                 auto_convert_args: true,
             }
@@ -795,6 +1049,8 @@ mod imp {
             Self {
                 globals: None,
                 ties: BTreeMap::new(),
+                popens: BTreeMap::new(),
+                next_popen_id: 1,
                 implicit_dotted_dispatch: interactive,
                 auto_convert_args: true,
             }
@@ -826,6 +1082,8 @@ mod imp {
                             )
                         })
                         .collect(),
+                    popens: BTreeMap::new(),
+                    next_popen_id: 1,
                     implicit_dotted_dispatch: self.implicit_dotted_dispatch,
                     auto_convert_args: self.auto_convert_args,
                 }
@@ -869,6 +1127,20 @@ mod imp {
 
         fn tie_names(&self) -> impl Iterator<Item = &String> {
             self.ties.keys()
+        }
+
+        fn alloc_popen_id(&mut self) -> u64 {
+            let id = self.next_popen_id;
+            self.next_popen_id = self.next_popen_id.saturating_add(1);
+            id
+        }
+
+        fn insert_popen(&mut self, id: u64, handle: PopenHandle) {
+            self.popens.insert(id, handle);
+        }
+
+        fn popen_mut(&mut self, id: u64) -> Option<&mut PopenHandle> {
+            self.popens.get_mut(&id)
         }
     }
 
@@ -1394,6 +1666,30 @@ mod imp {
                     .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
             )
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_popen, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_popen_wait, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_popen_poll, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_popen_communicate, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
 
         globals
             .set_item("_brush_bridge", bridge_module)
@@ -1907,6 +2203,11 @@ mod imp {
         } else {
             parse_stdio_spec(stderr, StdioSpec::Inherit)?
         };
+        let stdin_spec = if input.is_some() {
+            StdioSpec::Pipe
+        } else {
+            StdioSpec::Inherit
+        };
 
         let input_bytes = if let Some(input) = input {
             if let Ok(s) = input.extract::<String>() {
@@ -1919,17 +2220,6 @@ mod imp {
         } else {
             None
         };
-
-        if capture_output
-            || stdout_spec != StdioSpec::Inherit
-            || stderr_spec != StdioSpec::Inherit
-            || input_bytes.is_some()
-            || timeout.is_some()
-        {
-            return Err(PyRuntimeError::new_err(
-                "bash.run pipe/input/timeout features are deferred to phase 6 (bash.popen)",
-            ));
-        }
 
         let mut env_pairs = Vec::<(String, String)>::new();
         if let Some(env_map) = env {
@@ -1947,9 +2237,127 @@ mod imp {
             cwd,
             env: env_pairs,
         };
-        let _ = check;
-        let out = with_live_bridge(|bridge| bridge.run_command(py, &req))?;
-        run_outcome_to_py_dict(py, out)
+        let spec = PopenSpec {
+            stdin: stdin_spec,
+            stdout: stdout_spec,
+            stderr: stderr_spec,
+        };
+        let start = with_live_bridge(|bridge| bridge.popen_start(&req, &spec))?;
+        let (out_stdout, out_stderr, rc) =
+            with_live_bridge(|bridge| bridge.popen_communicate(start.id, input_bytes))?;
+
+        if timeout.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "bash.run timeout is not yet implemented",
+            ));
+        }
+
+        let out = RunOutcome {
+            returncode: rc,
+            stdout: out_stdout,
+            stderr: out_stderr,
+            args: start.args,
+        };
+
+        let out_obj = run_outcome_to_py_dict(py, out)?;
+        if check {
+            let d = out_obj.bind(py).downcast::<PyDict>()?;
+            let rc = d
+                .get_item("returncode")?
+                .and_then(|x| x.extract::<u8>().ok())
+                .unwrap_or(1);
+            if rc != 0 {
+                return Err(PyRuntimeError::new_err(
+                    "bash command returned non-zero exit status",
+                ));
+            }
+        }
+        Ok(out_obj)
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (args, stdin=None, stdout=None, stderr=None, shell=false, cwd=None, env=None))]
+    fn brush_popen(
+        py: Python<'_>,
+        args: Bound<'_, PyAny>,
+        stdin: Option<String>,
+        stdout: Option<String>,
+        stderr: Option<String>,
+        shell: bool,
+        cwd: Option<String>,
+        env: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        let args = extract_args(&args)?;
+        let stdin_spec = parse_stdio_spec(stdin, StdioSpec::Inherit)?;
+        let stdout_spec = parse_stdio_spec(stdout, StdioSpec::Inherit)?;
+        let stderr_spec = parse_stdio_spec(stderr, StdioSpec::Inherit)?;
+
+        let mut env_pairs = Vec::<(String, String)>::new();
+        if let Some(env_map) = env {
+            for (k, v) in env_map.iter() {
+                let key = any_to_key_string(k).map_err(to_py_runtime_error)?;
+                let val = py_any_to_string(&v).map_err(to_py_runtime_error)?;
+                env_pairs.push((key, val));
+            }
+        }
+
+        let req = RunRequest {
+            args,
+            shell,
+            capture_output: stdout_spec == StdioSpec::Pipe || stderr_spec == StdioSpec::Pipe,
+            cwd,
+            env: env_pairs,
+        };
+        let spec = PopenSpec {
+            stdin: stdin_spec,
+            stdout: stdout_spec,
+            stderr: stderr_spec,
+        };
+        let started = with_live_bridge(|bridge| bridge.popen_start(&req, &spec))?;
+        let d = PyDict::new(py);
+        d.set_item("id", started.id)?;
+        d.set_item("args", started.args)?;
+        d.set_item("stdin_pipe", matches!(stdin_spec, StdioSpec::Pipe))?;
+        d.set_item("stdout_pipe", matches!(stdout_spec, StdioSpec::Pipe))?;
+        d.set_item("stderr_pipe", matches!(stderr_spec, StdioSpec::Pipe))?;
+        Ok(d.unbind().into())
+    }
+
+    #[pyfunction]
+    fn brush_popen_wait(id: u64) -> PyResult<u8> {
+        with_live_bridge(|bridge| bridge.popen_wait(id))
+    }
+
+    #[pyfunction]
+    fn brush_popen_poll(id: u64) -> PyResult<Option<u8>> {
+        with_live_bridge(|bridge| bridge.popen_poll(id))
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (id, input=None))]
+    fn brush_popen_communicate(
+        py: Python<'_>,
+        id: u64,
+        input: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<PyObject> {
+        let input_bytes = if let Some(input) = input {
+            if let Ok(s) = input.extract::<String>() {
+                Some(s.into_bytes())
+            } else if let Ok(b) = input.extract::<Vec<u8>>() {
+                Some(b)
+            } else {
+                return Err(PyRuntimeError::new_err("input must be str or bytes"));
+            }
+        } else {
+            None
+        };
+        let (stdout, stderr, returncode) =
+            with_live_bridge(|bridge| bridge.popen_communicate(id, input_bytes))?;
+        let d = PyDict::new(py);
+        d.set_item("stdout", stdout)?;
+        d.set_item("stderr", stderr)?;
+        d.set_item("returncode", returncode)?;
+        Ok(d.unbind().into())
     }
 
     const BASH_BRIDGE_BOOTSTRAP: &str = r#"
@@ -2102,6 +2510,38 @@ class _BrushFnMap:
             safe = "fn"
         return f"_brush_fn_{safe}_{_BrushFnMap._seq}"
 
+class _BrushPopen:
+    def __init__(self, start):
+        self._id = int(start["id"])
+        self.args = start["args"]
+        self.stdin = object() if start.get("stdin_pipe") else None
+        self.stdout = object() if start.get("stdout_pipe") else None
+        self.stderr = object() if start.get("stderr_pipe") else None
+        self.returncode = None
+
+    def poll(self):
+        rc = _brush_bridge.brush_popen_poll(self._id)
+        if rc is not None:
+            self.returncode = int(rc)
+        return self.returncode
+
+    def wait(self):
+        self.returncode = int(_brush_bridge.brush_popen_wait(self._id))
+        return self.returncode
+
+    def communicate(self, input=None):
+        out = _brush_bridge.brush_popen_communicate(self._id, input)
+        self.returncode = int(out["returncode"])
+        return (out["stdout"], out["stderr"])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.returncode is None:
+            self.wait()
+        return False
+
 class _Brush:
     def __init__(self):
         self.vars = _BrushVarsMap()
@@ -2123,23 +2563,23 @@ class _Brush:
         if capture_output:
             stdout = self.PIPE
             stderr = self.PIPE
-        result = _brush_bridge.brush_run(
-            list(args),
-            capture_output,
-            stdout,
-            stderr,
-            check,
-            input,
-            shell,
-            timeout,
-            cwd,
-            env,
+        popen_obj = self.popen(
+            *args,
+            stdin=self.PIPE if input is not None else None,
+            stdout=stdout,
+            stderr=stderr,
+            shell=shell,
+            cwd=cwd,
+            env=env,
         )
+        out_stdout, out_stderr = popen_obj.communicate(input=input)
+        if timeout is not None:
+            raise RuntimeError("bash.run timeout is not yet implemented")
         completed = type("BashCompletedProcess", (), {})()
-        completed.args = result["args"]
-        completed.returncode = int(result["returncode"])
-        completed.stdout = result["stdout"]
-        completed.stderr = result["stderr"]
+        completed.args = popen_obj.args
+        completed.returncode = int(popen_obj.returncode)
+        completed.stdout = out_stdout
+        completed.stderr = out_stderr
         if check and completed.returncode != 0:
             err = RuntimeError("bash command returned non-zero exit status")
             err.returncode = completed.returncode
@@ -2148,6 +2588,10 @@ class _Brush:
             err.stderr = completed.stderr
             raise err
         return completed
+
+    def popen(self, *args, stdin=None, stdout=None, stderr=None, shell=False, cwd=None, env=None):
+        start = _brush_bridge.brush_popen(list(args), stdin, stdout, stderr, shell, cwd, env)
+        return _BrushPopen(start)
 
     def tie(self, name, getter, setter=None, type=None):
         _brush_bridge.brush_tie(name, getter, setter, type)

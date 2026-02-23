@@ -1,4 +1,4 @@
-//! Phase 3 integration tests for Python->bash callback APIs.
+//! Phase 6 integration tests for `bash.popen` and `bash.run` pipe features.
 
 #![cfg(all(unix, feature = "python-pyo3"))]
 #![cfg(test)]
@@ -58,47 +58,31 @@ fn run_script(script: &str) -> anyhow::Result<std::process::Output> {
 }
 
 #[test]
-fn bash_callable_returns_stdout_string() -> anyhow::Result<()> {
-    let output = run_script("py \"print(bash('echo', 'hello'))\"")?;
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "hello\n");
-    Ok(())
-}
-
-#[test]
-fn bash_run_returns_completed_shape_without_pipes() -> anyhow::Result<()> {
+fn bash_run_capture_output_and_stderr_pipe() -> anyhow::Result<()> {
     let output = run_script(
-        "py \"r = bash.run('true'); print(r.returncode); print(len(r.stdout)); print(len(r.stderr))\"",
+        "py \"r = bash.run('sh', '-c', 'echo out; echo err >&2', capture_output=True); print(r.stdout.strip()); print(r.stderr.strip())\"",
     )?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "0\n0\n0\n");
+    assert_eq!(String::from_utf8(output.stdout)?, "out\nerr\n");
     Ok(())
 }
 
 #[test]
-fn bash_run_check_raises_on_nonzero() -> anyhow::Result<()> {
+fn bash_run_input_pipe() -> anyhow::Result<()> {
     let output = run_script(
-        "py -x \"bash.run('false', check=True)\"; printf '%s|%s' \"$MCBASH_EXCEPTION\" \"$MCBASH_EXCEPTION_LANG\"",
+        "py \"r = bash.run('cat', capture_output=True, input='abc'); print(r.stdout)\"",
     )?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "RuntimeError|python");
+    assert_eq!(String::from_utf8(output.stdout)?, "abc\n");
     Ok(())
 }
 
 #[test]
-fn bash_run_shell_true_uses_command_string() -> anyhow::Result<()> {
-    let output = run_script("x=1; py \"bash.run('x=2', shell=True)\"; echo \"$x\"")?;
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "1\n");
-    Ok(())
-}
-
-#[test]
-fn bash_run_capture_output_works() -> anyhow::Result<()> {
+fn bash_popen_wait_and_communicate() -> anyhow::Result<()> {
     let output = run_script(
-        "py \"r = bash.run('echo', 'phase3', capture_output=True); print(r.stdout.strip())\"",
+        "py \"p = bash.popen('cat', stdin=bash.PIPE, stdout=bash.PIPE); out, err = p.communicate(input='xyz'); print(out); print(err); print(p.returncode)\"",
     )?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "phase3\n");
+    assert_eq!(String::from_utf8(output.stdout)?, "xyz\n\n0\n");
     Ok(())
 }
