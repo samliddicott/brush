@@ -45,6 +45,11 @@ mod imp {
         fn env_del(&mut self, name: &str) -> PyResult<()>;
         fn env_contains(&mut self, name: &str) -> PyResult<bool>;
         fn env_keys(&mut self) -> PyResult<Vec<String>>;
+        fn funcs_get_body(&mut self, name: &str) -> PyResult<String>;
+        fn funcs_contains(&mut self, name: &str) -> PyResult<bool>;
+        fn funcs_keys(&mut self) -> PyResult<Vec<String>>;
+        fn funcs_set_body(&mut self, name: &str, body: &str) -> PyResult<()>;
+        fn funcs_del(&mut self, name: &str) -> PyResult<()>;
         fn run_command(&mut self, py: Python<'_>, req: &RunRequest) -> PyResult<RunOutcome>;
     }
 
@@ -227,6 +232,43 @@ mod imp {
                 .iter_exported()
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>())
+        }
+
+        fn funcs_get_body(&mut self, name: &str) -> PyResult<String> {
+            let Some(reg) = self.shell().funcs().get(name) else {
+                return Err(PyKeyError::new_err(name.to_string()));
+            };
+            Ok(reg.definition().body.to_string())
+        }
+
+        fn funcs_contains(&mut self, name: &str) -> PyResult<bool> {
+            Ok(self.shell().funcs().get(name).is_some())
+        }
+
+        fn funcs_keys(&mut self) -> PyResult<Vec<String>> {
+            Ok(self
+                .shell()
+                .funcs()
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>())
+        }
+
+        fn funcs_set_body(&mut self, name: &str, body: &str) -> PyResult<()> {
+            let body_text = if body.trim_start().starts_with("()") {
+                body.to_string()
+            } else {
+                format!("() {{\n{body}\n}}")
+            };
+
+            self.shell_mut()
+                .define_func_from_str(name, body_text.as_str())
+                .map_err(to_py_runtime_error)
+        }
+
+        fn funcs_del(&mut self, name: &str) -> PyResult<()> {
+            let _ = self.shell_mut().undefine_func(name);
+            Ok(())
         }
 
         fn run_command(&mut self, _py: Python<'_>, req: &RunRequest) -> PyResult<RunOutcome> {
@@ -917,6 +959,36 @@ mod imp {
             .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
         bridge_module
             .add_function(
+                pyo3::wrap_pyfunction!(brush_funcs_get_body, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_funcs_contains, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_funcs_keys, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_funcs_set_body, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
+                pyo3::wrap_pyfunction!(brush_funcs_del, &bridge_module)
+                    .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
+            )
+            .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?;
+        bridge_module
+            .add_function(
                 pyo3::wrap_pyfunction!(brush_call, &bridge_module)
                     .map_err(|e| error::ErrorKind::InternalError(e.to_string()))?,
             )
@@ -1321,6 +1393,31 @@ mod imp {
     }
 
     #[pyfunction]
+    fn brush_funcs_get_body(name: String) -> PyResult<String> {
+        with_live_bridge(|bridge| bridge.funcs_get_body(name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_funcs_contains(name: String) -> PyResult<bool> {
+        with_live_bridge(|bridge| bridge.funcs_contains(name.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_funcs_keys() -> PyResult<Vec<String>> {
+        with_live_bridge(|bridge| bridge.funcs_keys())
+    }
+
+    #[pyfunction]
+    fn brush_funcs_set_body(name: String, body: String) -> PyResult<()> {
+        with_live_bridge(|bridge| bridge.funcs_set_body(name.as_str(), body.as_str()))
+    }
+
+    #[pyfunction]
+    fn brush_funcs_del(name: String) -> PyResult<()> {
+        with_live_bridge(|bridge| bridge.funcs_del(name.as_str()))
+    }
+
+    #[pyfunction]
     fn brush_call(py: Python<'_>, args: Bound<'_, PyAny>) -> PyResult<PyObject> {
         let args = extract_args(&args)?;
         let req = RunRequest {
@@ -1453,10 +1550,73 @@ class _BrushEnvMap:
     def __len__(self):
         return len(_brush_bridge.brush_env_keys())
 
+def _brush_raise_bash_error(args, result):
+    err = RuntimeError("bash command failed")
+    err.returncode = result["returncode"]
+    err.cmd = list(args)
+    err.stdout = result["stdout"]
+    err.stderr = result["stderr"]
+    raise err
+
+class _BrushFnCallable:
+    def __init__(self, name):
+        self._name = name
+
+    def __call__(self, *args):
+        cmd = [self._name]
+        cmd.extend(str(a) for a in args)
+        result = _brush_bridge.brush_call(cmd)
+        if result["returncode"] != 0:
+            _brush_raise_bash_error(cmd, result)
+        return result["stdout"].rstrip("\n")
+
+class _BrushFnMap:
+    _seq = 0
+
+    def __getitem__(self, name):
+        return _brush_bridge.brush_funcs_get_body(name)
+
+    def __setitem__(self, name, value):
+        if callable(value):
+            py_name = self._next_callable_name(name)
+            globals()[py_name] = value
+            _brush_bridge.brush_funcs_set_body(name, f'() {{ py {py_name} \"$@\"; }}')
+            return
+        if not isinstance(value, str):
+            raise TypeError("bash.fn assignment expects str body or callable")
+        _brush_bridge.brush_funcs_set_body(name, value)
+
+    def __delitem__(self, name):
+        _brush_bridge.brush_funcs_del(name)
+
+    def __contains__(self, name):
+        return _brush_bridge.brush_funcs_contains(name)
+
+    def __iter__(self):
+        return iter(_brush_bridge.brush_funcs_keys())
+
+    def __len__(self):
+        return len(_brush_bridge.brush_funcs_keys())
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        if not _brush_bridge.brush_funcs_contains(name):
+            raise AttributeError(name)
+        return _BrushFnCallable(name)
+
+    def _next_callable_name(self, name):
+        _BrushFnMap._seq += 1
+        safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in name)
+        if not safe:
+            safe = "fn"
+        return f"_brush_fn_{safe}_{_BrushFnMap._seq}"
+
 class _Brush:
     def __init__(self):
         self.vars = _BrushVarsMap()
         self.env = _BrushEnvMap()
+        self.fn = _BrushFnMap()
         self.PIPE = "PIPE"
         self.STDOUT = "STDOUT"
         self.DEVNULL = "DEVNULL"
@@ -1464,12 +1624,7 @@ class _Brush:
     def __call__(self, *args):
         result = _brush_bridge.brush_call(list(args))
         if result["returncode"] != 0:
-            err = RuntimeError("bash command failed")
-            err.returncode = result["returncode"]
-            err.cmd = list(args)
-            err.stdout = result["stdout"]
-            err.stderr = result["stderr"]
-            raise err
+            _brush_raise_bash_error(args, result)
         return result["stdout"].rstrip("\n")
 
     def run(self, *args, capture_output=False, stdout=None, stderr=None, check=False, input=None, shell=False, timeout=None, cwd=None, env=None):
